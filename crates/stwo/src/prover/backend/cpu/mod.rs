@@ -5,7 +5,7 @@ mod fri;
 mod grind;
 pub mod lookups;
 mod merkle_lifted;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 mod poseidon252;
 pub mod quotients;
 
@@ -18,7 +18,7 @@ use super::{Backend, BackendForChannel, Column, ColumnOps};
 use crate::core::utils::bit_reverse;
 use crate::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
 use crate::core::vcs_lifted::keccak256_merkle::Keccak256MerkleChannel;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 use crate::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
 use crate::prover::lookups::mle::Mle;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
@@ -30,7 +30,7 @@ impl Backend for CpuBackend {}
 impl BackendForChannel<Blake2sMerkleChannel> for CpuBackend {}
 impl BackendForChannel<Blake2sM31MerkleChannel> for CpuBackend {}
 impl BackendForChannel<Keccak256MerkleChannel> for CpuBackend {}
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 impl BackendForChannel<Poseidon252MerkleChannel> for CpuBackend {}
 
 impl<T: Debug + Clone + Default + Send + Sync> ColumnOps<T> for CpuBackend {

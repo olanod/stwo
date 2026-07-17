@@ -5,9 +5,9 @@ use std_shims::Vec;
 use super::fields::qm31::SecureField;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 mod poseidon252;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 pub use poseidon252::Poseidon252Channel;
 
 mod blake2s;

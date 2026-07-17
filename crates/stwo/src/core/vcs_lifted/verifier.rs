@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
     fn test_merkle_success_poseidon() {
         use crate::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleHasher;
         let (queries, decommitment, values, verifier) = prepare_merkle::<Poseidon252MerkleHasher>();

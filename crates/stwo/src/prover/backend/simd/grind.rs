@@ -154,7 +154,7 @@ impl GrindOps<Keccak256Channel> for SimdBackend {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 pub mod poseidon252 {
     use starknet_crypto::poseidon_hash_many;
     use starknet_ff::FieldElement as FieldElement252;
@@ -225,7 +225,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
     #[test]
     fn test_grind_poseidon() {
         let pow_bits = 10;
@@ -257,7 +257,7 @@ mod tests {
         test_grind_is_deterministic::<Blake2sChannel>();
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
     #[test]
     fn test_grind_poseidon_is_deterministic() {
         test_grind_is_deterministic::<crate::core::channel::Poseidon252Channel>();

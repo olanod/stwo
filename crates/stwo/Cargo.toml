@@ -6,7 +6,7 @@ license.workspace = true
 description = "Core library implementing the Circle STARK prover and verifier"
 
 [features]
-default = ["std"]
+default = ["std", "poseidon252"]
 std = [
     "blake2/std",
     "blake3/std",
@@ -14,13 +14,18 @@ std = [
     "itertools/use_std",
     "indexmap/std",
     "num-traits/std",
-    "starknet-crypto/std",
+    "starknet-crypto?/std",
     "thiserror/std",
     "tracing/std",
     "serde/std",
     "tracing-subscriber/std",
     "stwo-std-shims/std",
 ]
+# The Poseidon252 PCS (starknet-crypto/starknet-ff). Default-on so native users are
+# unaffected. no_std verify-only consumers (default-features = false) get it OFF,
+# which keeps starknet-ff's forced `getrandom/js -> wasm-bindgen -> std` subtree out
+# of wasm32 `-Z build-std=core,alloc` (PVF) graphs.
+poseidon252 = ["dep:starknet-crypto", "dep:starknet-ff"]
 prover = ["std", "tracing/attributes", "dep:dashmap"]
 parallel = ["rayon", "indexmap/rayon"]
 slow-tests = []
@@ -42,15 +47,18 @@ num-traits.workspace = true
 rand.workspace = true
 starknet-crypto = { version = "0.6.2", default-features = false, features = [
     "alloc",
-] }
+], optional = true }
 starknet-ff = { version = "0.3.7", default-features = false, features = [
     "alloc",
     "serde",
-] }
+], optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 rayon = { workspace = true, optional = true }
-serde.workspace = true
+# `alloc` was previously provided implicitly by starknet-ff's `alloc = ["serde?/alloc"]`;
+# stwo's own proof types (Vec<T>: Deserialize) need it, so own it explicitly now that
+# starknet-ff is optional.
+serde = { workspace = true, features = ["alloc"] }
 tracing-subscriber.workspace = true
 hashbrown.workspace = true
 stwo-std-shims = { version = "1.0.0", default-features = false }

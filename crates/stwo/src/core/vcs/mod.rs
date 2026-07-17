@@ -7,7 +7,7 @@ pub mod hash;
 pub mod keccak256_hash;
 mod merkle_hasher;
 pub use merkle_hasher::MerkleHasher;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 pub mod poseidon252_merkle;
 #[cfg(all(test, feature = "prover"))]
 pub mod test_utils;
