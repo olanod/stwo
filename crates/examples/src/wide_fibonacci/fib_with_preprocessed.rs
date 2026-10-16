@@ -92,7 +92,8 @@ mod tests {
     use stwo::core::channel::Blake2sM31Channel;
     use stwo::core::fields::m31::BaseField;
     use stwo::core::fields::qm31::SecureField;
-    use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
+    use stwo::core::fri::FriConfig;
+    use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
     use stwo::core::poly::circle::CanonicCoset;
     use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
     use stwo::core::verifier::verify;
@@ -106,6 +107,7 @@ mod tests {
 
     use super::{generate_preprocessed_trace, generate_trace, FibInput, WideFibWithPpEval};
     use crate::wide_fibonacci::fib_with_preprocessed::WideFibWithPpComponent;
+    use crate::wide_fibonacci::{WideFibonacciComponent, WideFibonacciEval};
 
     const FIB_SEQUENCE_LENGTH: usize = 3;
 
@@ -177,6 +179,90 @@ mod tests {
             commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
             verify(&[&component], verifier_channel, commitment_scheme, proof).unwrap();
         }
+    }
+
+    #[test_log::test]
+    /// The preprocessed tree sits below the lifting height, so its query positions are mapped by
+    /// `prepare_preprocessed_query_positions`, which does not preserve their order. A second,
+    /// larger component raises the lifting height; many queries on a small domain make unsorted
+    /// and non-adjacent duplicate preprocessed positions certain.
+    fn test_wide_fib_with_pp_below_lifting_height() {
+        let log_n_pp_rows = 4;
+        let log_n_rows = log_n_pp_rows + 2;
+        let config = PcsConfig {
+            pow_bits: 0,
+            fri_config: FriConfig::new(0, 1, 64, 1),
+            lifting_log_size: None,
+        };
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(log_n_rows + 1 + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+
+        // Prove.
+        let prover_channel = &mut Blake2sM31Channel::default();
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(config, &twiddles);
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(vec![generate_preprocessed_trace(log_n_pp_rows)]);
+        tree_builder.commit(prover_channel);
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(generate_trace::<FIB_SEQUENCE_LENGTH, _>(
+            &generate_test_inputs(log_n_pp_rows),
+        ));
+        let large_inputs = (0..1 << log_n_rows)
+            .map(|i| crate::wide_fibonacci::FibInput {
+                a: BaseField::one(),
+                b: BaseField::from_u32_unchecked(i),
+            })
+            .collect_vec();
+        tree_builder.extend_evals(crate::wide_fibonacci::generate_trace::<
+            FIB_SEQUENCE_LENGTH,
+            _,
+        >(&large_inputs));
+        tree_builder.commit(prover_channel);
+        let allocator = &mut TraceLocationAllocator::default();
+        let pp_component = WideFibWithPpComponent::new(
+            allocator,
+            WideFibWithPpEval::<FIB_SEQUENCE_LENGTH> {
+                log_n_rows: log_n_pp_rows,
+            },
+            SecureField::zero(),
+        );
+        let large_component = WideFibonacciComponent::new(
+            allocator,
+            WideFibonacciEval::<FIB_SEQUENCE_LENGTH> { log_n_rows },
+            SecureField::zero(),
+        );
+        let proof = prove::<SimdBackend, Blake2sM31MerkleChannel>(
+            &[&pp_component, &large_component],
+            prover_channel,
+            commitment_scheme,
+        )
+        .unwrap();
+
+        // Verify.
+        let verifier_channel = &mut Blake2sM31Channel::default();
+        let commitment_scheme =
+            &mut CommitmentSchemeVerifier::<Blake2sM31MerkleChannel>::new(config);
+        let sizes = TreeVec::concat_cols(
+            [
+                pp_component.trace_log_degree_bounds(),
+                large_component.trace_log_degree_bounds(),
+            ]
+            .into_iter(),
+        );
+        commitment_scheme.commit(proof.commitments[0], &[log_n_pp_rows], verifier_channel);
+        commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
+        assert!(commitment_scheme.trees[0].height < commitment_scheme.trees[1].height);
+        verify(
+            &[&pp_component, &large_component],
+            verifier_channel,
+            commitment_scheme,
+            proof,
+        )
+        .unwrap();
     }
 
     #[test_log::test]
