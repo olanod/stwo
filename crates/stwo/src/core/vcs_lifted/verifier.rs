@@ -91,6 +91,9 @@ impl<H: MerkleHasherLifted> MerkleVerifierLifted<H> {
     ///
     /// Returns an error if any of the following conditions are met:
     ///
+    /// * The queried values are not one column per committed column of one value per query
+    ///   position.
+    /// * Two values at a repeated query position differ.
     /// * The witness is too long (not fully consumed).
     /// * The witness is too short (missing values).
     /// * The computed root does not match the expected root.
@@ -110,10 +113,14 @@ impl<H: MerkleHasherLifted> MerkleVerifierLifted<H> {
         if self.height == 0 {
             return Ok(());
         };
-        // Check that the structure of the input is consistent with the configurations.
-        assert_eq!(queried_values.len(), self.column_log_sizes.len());
-        for values in queried_values.iter() {
-            assert_eq!(values.len(), query_positions.len());
+        // The queried values come from the proof: one column per committed column, one value
+        // per query position.
+        if queried_values.len() != self.column_log_sizes.len()
+            || queried_values
+                .iter()
+                .any(|values| values.len() != query_positions.len())
+        {
+            return Err(MerkleVerificationError::QueriedValuesShapeMismatch);
         }
 
         // Sort the queried values in ascending order by column log size.
@@ -136,11 +143,12 @@ impl<H: MerkleHasherLifted> MerkleVerifierLifted<H> {
                 Entry::Vacant(entry) => {
                     entry.insert(values);
                 }
-                // Otherwise, we check that the queried values are equal to what's already in the
-                // map.
+                // Otherwise, the proof's values there must equal the ones already in the map:
+                // the proof repeats a row once per repeated position.
                 Entry::Occupied(entry) => {
-                    let old_values = entry.get();
-                    assert_eq!(old_values, &values);
+                    if entry.get() != &values {
+                        return Err(MerkleVerificationError::DuplicatePositionMismatch);
+                    }
                 }
             }
         }
@@ -206,6 +214,10 @@ pub enum MerkleVerificationError {
     WitnessTooLong,
     #[error("Root mismatch.")]
     RootMismatch,
+    #[error("The queried values do not match the committed columns or the query positions.")]
+    QueriedValuesShapeMismatch,
+    #[error("The values at a repeated query position differ.")]
+    DuplicatePositionMismatch,
 }
 
 #[cfg(all(test, feature = "prover"))]
@@ -315,6 +327,67 @@ mod tests {
         assert_eq!(
             verifier.verify(&queries, values, decommitment).unwrap_err(),
             MerkleVerificationError::WitnessTooLong
+        );
+    }
+
+    /// A repeated query position whose two rows differ is refused, not a panic, whether the
+    /// rows differ in the smallest column or the largest; equal rows verify.
+    #[test]
+    fn test_merkle_duplicate_positions_with_different_values() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let log_sizes = vec![3, 4, 3];
+        let cols: Vec<Vec<BaseField>> = log_sizes
+            .iter()
+            .map(|&log_size| {
+                (0..(1 << log_size))
+                    .map(|_| BaseField::from(rng.gen_range(1..(1u32 << 30))))
+                    .collect()
+            })
+            .collect();
+        let merkle = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit(
+            cols.iter().collect(),
+            4,
+            0,
+        );
+        let queries = vec![13, 3, 7, 3, 1];
+        let (values, decommitment) = merkle.decommit(&queries, cols.iter().collect());
+        let verifier = MerkleVerifierLifted::new(merkle.root(), log_sizes, None);
+        verifier
+            .verify(&queries, values.clone(), decommitment.decommitment.clone())
+            .unwrap();
+        // Positions 1 and 3 hold the second occurrence of position 3.
+        for column in 0..3 {
+            let mut tampered = values.clone();
+            tampered[column][3] += BaseField::from(1);
+            assert_eq!(
+                verifier
+                    .verify(&queries, tampered, decommitment.decommitment.clone())
+                    .unwrap_err(),
+                MerkleVerificationError::DuplicatePositionMismatch,
+                "column {column}"
+            );
+        }
+    }
+
+    /// Queried values of the wrong shape are refused, not a panic.
+    #[test]
+    fn test_merkle_queried_values_of_the_wrong_shape() {
+        let (queries, decommitment, values, verifier) = prepare_merkle::<Blake2sMerkleHasher>();
+        let mut missing_column = values.clone();
+        missing_column.pop();
+        assert_eq!(
+            verifier
+                .verify(&queries, missing_column, decommitment.clone())
+                .unwrap_err(),
+            MerkleVerificationError::QueriedValuesShapeMismatch
+        );
+        let mut short_column = values;
+        short_column[1].pop();
+        assert_eq!(
+            verifier
+                .verify(&queries, short_column, decommitment)
+                .unwrap_err(),
+            MerkleVerificationError::QueriedValuesShapeMismatch
         );
     }
 
