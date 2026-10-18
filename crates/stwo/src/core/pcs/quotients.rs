@@ -1,11 +1,13 @@
+use core::iter;
 use core::ops::Add;
 
-use itertools::{izip, zip_eq, Itertools};
+use itertools::{izip, zip_eq, Either, Itertools};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
 use std_shims::Vec;
 
-use super::TreeVec;
+use super::{DeepBatching, TreeVec};
+use crate::core::channel::Channel;
 use crate::core::circle::CirclePoint;
 use crate::core::constraints::complex_conjugate_line_coeffs;
 use crate::core::fields::cm31::CM31;
@@ -110,7 +112,8 @@ pub struct PointSample {
 /// ```plain
 ///     ∑ ∑ α^{k(i, z)} * (c(i, z) * f̃ᵢ(p) - b(i, z) - a(i, z)) / line(z,conj(z))(p)
 /// ```
-/// where:
+/// where (with `α^{k(i, z)}` the `k(i, z)`-th of `random_coeff`'s coefficients, see
+/// [`DeepCoefficients`]):
 /// * the outer sum is over the set of sample points `z`,
 /// * the inner sum is over the set of columns (corresponding to index `i`),
 /// * line(z,conj(z))(p) is the equation of the line through (z, conj(z)) evaluated at `p`
@@ -120,7 +123,7 @@ pub struct PointSample {
 pub fn fri_answers(
     column_log_sizes: TreeVec<Vec<u32>>,
     samples: TreeVec<Vec<Vec<PointSample>>>,
-    random_coeff: SecureField,
+    random_coeff: impl Into<DeepCoefficients>,
     query_positions: &[usize],
     queried_values: TreeVec<ColumnVec<Vec<BaseField>>>,
     lifting_log_size: u32,
@@ -292,13 +295,10 @@ pub fn build_samples_with_randomness_and_periodicity(
     samples: &TreeVec<Vec<Vec<PointSample>>>,
     column_log_sizes: Vec<impl Iterator<Item = u32>>,
     lifting_log_size: u32,
-    random_coeff: SecureField,
+    random_coeff: impl Into<DeepCoefficients>,
 ) -> TreeVec<Vec<Vec<(PointSample, SecureField)>>> {
-    let mut random_pows = (0..).scan(SecureField::one(), |acc, _| {
-        let curr = *acc;
-        *acc *= random_coeff;
-        Some(curr)
-    });
+    let coefficients = random_coeff.into();
+    let mut random_pows = coefficients.iter();
     let mut res: Vec<Vec<Vec<(PointSample, SecureField)>>> = Vec::new();
     let lifting_domain_generator = CanonicCoset::new(lifting_log_size).step();
     for (samples_per_tree, sizes_per_tree) in samples.iter().zip(column_log_sizes.into_iter()) {
@@ -314,6 +314,7 @@ pub fn build_samples_with_randomness_and_periodicity(
                 // is added even when the column is at its maximal size, in which case the
                 // periodicity sample coincides with the OOD point sample. This simplifies the
                 // Verifier logic by avoiding the need to track column sizes.
+                // `deep_values_of_column` counts the values this pushes.
                 if let [_prev_point_sample, point_sample] = &samples_per_cols[..] {
                     let period_generator = lifting_domain_generator.repeated_double(log_size);
                     new_samples.push((
@@ -321,11 +322,14 @@ pub fn build_samples_with_randomness_and_periodicity(
                             point: point_sample.point.add(period_generator.into_ef()),
                             value: point_sample.value,
                         },
-                        random_pows.next().unwrap(),
+                        random_pows.next().expect(ONE_COEFFICIENT_A_VALUE),
                     ));
                 }
                 for sample in samples_per_cols.iter() {
-                    new_samples.push((sample.clone(), random_pows.next().unwrap()));
+                    new_samples.push((
+                        sample.clone(),
+                        random_pows.next().expect(ONE_COEFFICIENT_A_VALUE),
+                    ));
                 }
                 new_samples
             })
@@ -333,4 +337,98 @@ pub fn build_samples_with_randomness_and_periodicity(
         res.push(samples_with_randomness_and_periodicity);
     }
     TreeVec(res)
+}
+
+const ONE_COEFFICIENT_A_VALUE: &str = "the coefficients are drawn one a sampled value";
+
+/// The values the DEEP quotient batches for a column sampled at `n_samples` points: each sample,
+/// and a periodicity sample when there are two.
+pub const fn deep_values_of_column(n_samples: usize) -> usize {
+    if n_samples == 2 {
+        3
+    } else {
+        n_samples
+    }
+}
+
+/// Every value the DEEP quotient batches, `B`: one coefficient each.
+pub fn n_deep_values(samples: &TreeVec<Vec<Vec<PointSample>>>) -> usize {
+    samples
+        .iter()
+        .flatten()
+        .map(|column| deep_values_of_column(column.len()))
+        .sum()
+}
+
+/// The coefficients the DEEP quotient batches its sampled values by, in the order
+/// [`build_samples_with_randomness_and_periodicity`] enumerates the values: the `i`-th value's
+/// quotient `Q_i` enters the function FRI tests, `Q = Σ_i c_i · Q_i`, with coefficient `c_i`.
+/// The coefficients are drawn from the channel after every commitment and every sampled value
+/// has been mixed into it, so they are independent of the `Q_i`.
+///
+/// # Soundness
+///
+/// The batching step's error is the probability, over the coefficients, that `Q` is within the
+/// proximity parameter of the code while some `Q_i` is not (a failure of correlated agreement).
+///
+/// - **[`DeepCoefficients::Powers`]**, `c_i = α^i`: `Q` ranges over a curve of degree `B − 1` in
+///   the `Q_i`, and the error is `(B − 1) · ε`, `ε` a line's error (BCIKS20, Theorem 6.2, for
+///   curves).
+/// - **[`DeepCoefficients::Affine`]**, `c_0 = 1` and `c_1 … c_{B−1}` independent and uniform in
+///   QM31: `Q` is uniform over the affine space `Q_0 + span{Q_1, …, Q_{B−1}}`, and correlated
+///   agreement over an affine space holds with a line's error `ε` whatever its dimension (BCIKS20,
+///   Theorem 1.6). The `(B − 1)` factor leaves the batching term: about `log2(B − 1)` bits, 9.8 for
+///   916 values.
+///
+/// BCIKS20 is Ben-Sasson, Carmon, Ishai, Kopparty, Saraf, "Proximity Gaps for Reed–Solomon
+/// Codes" (FOCS 2020, eprint 2020/654). In the Johnson regime `ε` is the line error of Theorem
+/// 4.2 of BCHKS25 (eprint 2025/2055), `ε_lin(k)` at the tested dimension `k`, and soundcalc
+/// (`github.com/ethereum/soundcalc`, revision `2af5e7df`) counts the two batchings exactly so:
+/// `pcs/pcs.py`, `_get_batching_error`, takes `get_error_powers` (`(B − 1) · ε_lin`) for powers
+/// and `get_error_linear` (`ε_lin`) for "affine batching: `c_0 = 1, c_i = r_i` for independent
+/// random values `r_i`" (`pcs/fri.py`; the theorems are cited in `proxgaps/proxgaps_regime.py`).
+///
+/// Each `r_i` is a uniform QM31 element: four M31 coordinates drawn by rejection sampling. The
+/// verifier draws `B − 1` of them, `⌈(B − 1) / 2⌉` channel hashes on the Blake2s and Blake2b
+/// channels, against one for powers. FRI's own folds keep powers of their `α`: each round is
+/// counted as `(f − 1) · ε_lin` either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeepCoefficients {
+    /// `1, α, α², …`.
+    Powers(SecureField),
+    /// `r_1, …, r_{B−1}`; the first value's coefficient is 1.
+    Affine(Vec<SecureField>),
+}
+
+impl DeepCoefficients {
+    /// Draws the coefficients for `n_values` sampled values: one element for powers, `n_values
+    /// − 1` for affine batching.
+    pub fn draw(channel: &mut impl Channel, batching: DeepBatching, n_values: usize) -> Self {
+        match batching {
+            DeepBatching::Powers => Self::Powers(channel.draw_secure_felt()),
+            DeepBatching::Affine => {
+                Self::Affine(channel.draw_secure_felts(n_values.saturating_sub(1)))
+            }
+        }
+    }
+
+    /// The coefficients in order, the first 1; unbounded for powers.
+    pub fn iter(&self) -> impl Iterator<Item = SecureField> + '_ {
+        match self {
+            Self::Powers(alpha) => {
+                Either::Left(iter::successors(Some(SecureField::one()), move |c| {
+                    Some(*c * *alpha)
+                }))
+            }
+            Self::Affine(coefficients) => {
+                Either::Right(iter::once(SecureField::one()).chain(coefficients.iter().copied()))
+            }
+        }
+    }
+}
+
+impl From<SecureField> for DeepCoefficients {
+    fn from(alpha: SecureField) -> Self {
+        Self::Powers(alpha)
+    }
 }

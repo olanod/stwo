@@ -252,7 +252,7 @@ mod tests {
             let config = PcsConfig {
                 pow_bits: 10,
                 fri_config: FriConfig::new(0, 2, 3, 1),
-                lifting_log_size: None,
+                ..Default::default()
             };
             // Precompute twiddles for the larger committed domain.
             let twiddles = SimdBackend::precompute_twiddles(
@@ -430,6 +430,77 @@ mod tests {
         let mut tampered = proof;
         tampered.0.queried_values[1][0][0] += BaseField::one();
         assert!(verify_with(tampered).is_err());
+    }
+
+    /// The final wrap's configuration: Blake2b-256, blowup 64, fold step 3, a 2^6 last layer and
+    /// affine DEEP batching. The proof verifies under it, and is refused under powers batching
+    /// and with a changed sampled value.
+    #[test]
+    fn test_wide_fib_prove_with_affine_batching() {
+        use stwo::core::channel::Blake2bChannel;
+        use stwo::core::pcs::DeepBatching;
+        use stwo::core::proof::StarkProof;
+        use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
+
+        const LOG_N_INSTANCES: u32 = 10;
+        let config = PcsConfig {
+            pow_bits: 10,
+            fri_config: FriConfig::new(6, 6, 20, 3),
+            lifting_log_size: None,
+            deep_batching: DeepBatching::Affine,
+        };
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(LOG_N_INSTANCES + 1 + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+        let prover_channel = &mut Blake2bChannel::default();
+        config.mix_into(prover_channel);
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<SimdBackend, Blake2bMerkleChannel>::new(config, &twiddles);
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(vec![]);
+        tree_builder.commit(prover_channel);
+        let trace =
+            generate_trace::<FIB_SEQUENCE_LENGTH, _>(&generate_test_inputs(LOG_N_INSTANCES));
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(trace);
+        tree_builder.commit(prover_channel);
+        let component = WideFibonacciComponent::new(
+            &mut TraceLocationAllocator::default(),
+            WideFibonacciEval::<FIB_SEQUENCE_LENGTH> {
+                log_n_rows: LOG_N_INSTANCES,
+            },
+            SecureField::zero(),
+        );
+        let proof = prove::<SimdBackend, Blake2bMerkleChannel>(
+            &[&component],
+            prover_channel,
+            commitment_scheme,
+        )
+        .unwrap();
+
+        let verify_with = |config: PcsConfig, proof: StarkProof<Blake2bMerkleHasher>| {
+            let verifier_channel = &mut Blake2bChannel::default();
+            config.mix_into(verifier_channel);
+            let commitment_scheme =
+                &mut CommitmentSchemeVerifier::<Blake2bMerkleChannel>::new(config);
+            let sizes = component.trace_log_degree_bounds();
+            commitment_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
+            commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
+            verify(&[&component], verifier_channel, commitment_scheme, proof)
+        };
+        verify_with(config, proof.clone()).unwrap();
+
+        let powers = PcsConfig {
+            deep_batching: DeepBatching::Powers,
+            ..config
+        };
+        assert!(verify_with(powers, proof.clone()).is_err());
+
+        let mut tampered = proof;
+        tampered.0.sampled_values[1][5][0] += SecureField::one();
+        assert!(verify_with(config, tampered).is_err());
     }
 
     #[test]

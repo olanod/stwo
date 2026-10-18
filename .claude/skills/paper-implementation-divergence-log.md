@@ -207,6 +207,24 @@ For fold step 3 that is about 0.8 bits on the fold term.
 Status: OPEN
 Notes: Tamper tests at fold step 3 in `prover/fri.rs` (`fold_step_3_tests`).
 
+### DIVERGENCE-012: Affine DEEP Batching (opt-in)
+
+Paper: `.agents/papers/llm/Stwo_Whitepaper.llm.md` — the DEEP quotient batches the
+sampled values' quotients by powers of one coefficient.
+
+Code: `crates/stwo/src/core/pcs/quotients.rs` (`DeepCoefficients`) and
+`crates/stwo/src/core/pcs/mod.rs` (`DeepBatching`, `PcsConfig::deep_batching`) —
+with `DeepBatching::Affine` the first quotient's coefficient is 1 and every other's is
+drawn independently from the channel (after the sampled values are mixed), in place of
+`α^i`. `DeepBatching::Powers`, the default, is the paper's.
+
+Type: Intentional extension (soundness)
+Risk: SOUNDNESS — improves the batching term from `(B - 1)·ε` (curves, BCIKS20 Thm 6.2)
+to `ε` (affine spaces, BCIKS20 Thm 1.6), as soundcalc `2af5e7df` counts it. The field is
+not serialized: a verifier must set it from its own configuration, never from a proof.
+Status: OPEN (needs cryptographer review of the citation and the count)
+Notes: Tests in `prover/pcs/quotient_ops.rs` and the wide-Fibonacci example.
+
 ## Resolved Divergences
 
 ### DIVERGENCE-005 (see above)

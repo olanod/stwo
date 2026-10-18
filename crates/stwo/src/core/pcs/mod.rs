@@ -12,6 +12,7 @@ pub mod utils;
 mod verifier;
 
 use serde::{Deserialize, Serialize};
+use std_shims::vec;
 
 pub use self::utils::TreeVec;
 pub use self::verifier::CommitmentSchemeVerifier;
@@ -39,7 +40,29 @@ pub struct PcsConfig {
     /// (an implicit assumption here is that the largest domains are all of equal size across
     /// trees, except possibly for the preprocessed tree).
     pub lifting_log_size: Option<u32>,
+    /// How the DEEP quotient batches the sampled values; [`DeepBatching::Powers`] unless a
+    /// configuration opts in.
+    ///
+    /// Not serialized: a proof's bytes are the same under either batching, so a verifier sets it
+    /// from its own configuration (the proof's format), never from a deserialized proof, whose
+    /// field reads [`DeepBatching::Powers`]. A proof batched one way fails under the other.
+    #[serde(skip)]
+    pub deep_batching: DeepBatching,
 }
+
+/// How the DEEP quotient combines its sampled values into the one function FRI tests: the
+/// coefficient of each value's quotient. See [`quotients::DeepCoefficients`] for the soundness
+/// of each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeepBatching {
+    /// `1, α, α², …`: powers of one coefficient drawn from the channel.
+    #[default]
+    Powers,
+    /// `1, r_1, r_2, …`: an independent coefficient drawn from the channel for every value but
+    /// the first.
+    Affine,
+}
+
 impl PcsConfig {
     pub const fn security_bits(&self) -> u32 {
         self.pow_bits + self.fri_config.security_bits()
@@ -50,6 +73,7 @@ impl PcsConfig {
             pow_bits,
             fri_config,
             lifting_log_size,
+            deep_batching,
         } = self;
         let FriConfig {
             log_blowup_factor,
@@ -58,7 +82,7 @@ impl PcsConfig {
             fold_step,
         } = fri_config;
 
-        channel.mix_felts(&[
+        let mut felts = vec![
             SecureField::from_u32_unchecked(
                 *pow_bits,
                 *log_blowup_factor,
@@ -66,7 +90,12 @@ impl PcsConfig {
                 *log_last_layer_degree_bound,
             ),
             SecureField::from_u32_unchecked(*fold_step, lifting_log_size.unwrap_or(0), 0, 0),
-        ]);
+        ];
+        // Affine batching adds a third element, so the default's transcript is unchanged.
+        if *deep_batching == DeepBatching::Affine {
+            felts.push(SecureField::from_u32_unchecked(1, 0, 0, 0));
+        }
+        channel.mix_felts(&felts);
     }
 }
 
@@ -76,6 +105,7 @@ impl Default for PcsConfig {
             pow_bits: 10,
             fri_config: FriConfig::new(0, 1, 3, 1),
             lifting_log_size: None,
+            deep_batching: DeepBatching::Powers,
         }
     }
 }
@@ -87,7 +117,7 @@ mod tests {
         let config = super::PcsConfig {
             pow_bits: 42,
             fri_config: super::FriConfig::new(10, 10, 70, 1),
-            lifting_log_size: None,
+            ..Default::default()
         };
         assert!(config.security_bits() == 10 * 70 + 42);
     }

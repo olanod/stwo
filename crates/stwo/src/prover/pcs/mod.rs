@@ -9,7 +9,8 @@ use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::{
-    CommitmentSchemeProof, CommitmentSchemeProofAux, ExtendedCommitmentSchemeProof, PointSample,
+    n_deep_values, CommitmentSchemeProof, CommitmentSchemeProofAux, DeepCoefficients,
+    ExtendedCommitmentSchemeProof, PointSample,
 };
 use crate::core::pcs::utils::prepare_preprocessed_query_positions;
 use crate::core::pcs::{PcsConfig, TreeSubspan, TreeVec};
@@ -223,6 +224,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .as_cols_ref()
             .map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
+        let coefficients =
+            DeepCoefficients::draw(channel, self.config.deep_batching, n_deep_values(&samples));
 
         let columns = self.evaluations();
         print_column_size_histogram::<B, MC>(&columns);
@@ -230,7 +233,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         let quotients = compute_fri_quotients(
             &columns,
             &samples,
-            channel.draw_secure_felt(),
+            coefficients,
             lifting_log_size,
             self.twiddles,
             self.config.fri_config.log_blowup_factor,

@@ -6,7 +6,7 @@ use std_shims::Vec;
 use super::super::circle::CirclePoint;
 use super::super::fields::qm31::SecureField;
 use super::super::fri::{CirclePolyDegreeBound, FriVerifier};
-use super::quotients::{fri_answers, PointSample};
+use super::quotients::{fri_answers, n_deep_values, DeepCoefficients, PointSample};
 use super::utils::TreeVec;
 use super::PcsConfig;
 use crate::core::channel::{Channel, MerkleChannel};
@@ -63,7 +63,15 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
         channel: &mut MC::C,
     ) -> Result<(), VerificationError> {
         channel.mix_felts(&proof.sampled_values.clone().flatten_cols());
-        let random_coeff = channel.draw_secure_felt();
+        let samples = sampled_points.zip_cols(proof.sampled_values).map_cols(
+            |(sampled_points, sampled_values)| {
+                zip(sampled_points, sampled_values)
+                    .map(|(point, value)| PointSample { point, value })
+                    .collect_vec()
+            },
+        );
+        let coefficients =
+            DeepCoefficients::draw(channel, self.config.deep_batching, n_deep_values(&samples));
         let lifting_log_size = self.trees.last().unwrap().height;
         let bound =
             CirclePolyDegreeBound::new(lifting_log_size - self.config.fri_config.log_blowup_factor);
@@ -115,18 +123,10 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
             .into_iter()
             .collect::<Result<(), _>>()?;
         // Answer FRI queries.
-        let samples = sampled_points.zip_cols(proof.sampled_values).map_cols(
-            |(sampled_points, sampled_values)| {
-                zip(sampled_points, sampled_values)
-                    .map(|(point, value)| PointSample { point, value })
-                    .collect_vec()
-            },
-        );
-
         let fri_answers = fri_answers(
             self.column_log_sizes(),
             samples,
-            random_coeff,
+            coefficients,
             &query_positions,
             proof.queried_values,
             lifting_log_size,

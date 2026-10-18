@@ -7,7 +7,7 @@ use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::{
-    build_samples_with_randomness_and_periodicity, ColumnSampleBatch, PointSample,
+    build_samples_with_randomness_and_periodicity, ColumnSampleBatch, DeepCoefficients, PointSample,
 };
 use crate::core::pcs::TreeVec;
 use crate::prover::backend::ColumnOps;
@@ -86,7 +86,7 @@ pub struct AccumulatedNumerators<B: ColumnOps<BaseField>> {
 pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     columns: &TreeVec<Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>>>,
     samples: &TreeVec<Vec<Vec<PointSample>>>,
-    random_coeff: SecureField,
+    random_coeff: impl Into<DeepCoefficients>,
     lifting_log_size: u32,
     twiddles: &TwiddleTree<B>,
     log_blowup_factor: u32,
@@ -171,17 +171,21 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
-    use num_traits::Zero;
+    use num_traits::{One, Zero};
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
-    use crate::core::channel::Blake2sChannel;
+    use crate::core::channel::{Blake2sChannel, Channel, MerkleChannel};
     use crate::core::circle::SECURE_FIELD_CIRCLE_GEN;
     use crate::core::fields::m31::M31;
-    use crate::core::pcs::quotients::PointSample;
-    use crate::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
+    use crate::core::fri::FriConfig;
+    use crate::core::pcs::quotients::{
+        fri_answers, n_deep_values, CommitmentSchemeProof, DeepCoefficients, PointSample,
+    };
+    use crate::core::pcs::{CommitmentSchemeVerifier, DeepBatching, PcsConfig, TreeVec};
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+    use crate::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
     use crate::core::verifier::VerificationError;
     use crate::prover::backend::cpu::{CpuCircleEvaluation, CpuCirclePoly};
     use crate::prover::backend::simd::column::BaseColumn;
@@ -355,5 +359,269 @@ mod tests {
         let zeros = coeffs[0].coeffs.split_off((1 << LOG_SIZE) - 1);
 
         assert!(zeros.iter().all(|c| c.is_zero()));
+    }
+
+    /// Under either batching, the function the verifier's answers sample (the batched DEEP
+    /// quotient, at every point of the domain) is of low degree when the sampled values are the
+    /// polynomials' values, and a single wrong value makes it high degree: what FRI refuses.
+    /// The prover's own quotient agrees with it on correct values.
+    #[test]
+    fn quotients_are_low_degree_exactly_when_the_values_are_right() {
+        const LOG_SIZE: u32 = 5;
+        const LOG_BLOWUP_FACTOR: u32 = 2;
+        const LOG_DOMAIN: u32 = LOG_SIZE + LOG_BLOWUP_FACTOR;
+        let mut rng = SmallRng::seed_from_u64(1);
+        let random_felt = |rng: &mut SmallRng| {
+            SecureField::from_m31_array(std::array::from_fn(|_| M31::from(rng.gen::<u32>())))
+        };
+        let polys = (0..3)
+            .map(|_| {
+                CpuCirclePoly::new(
+                    (0..1 << LOG_SIZE)
+                        .map(|_| M31::from(rng.gen::<u32>()))
+                        .collect(),
+                )
+            })
+            .collect_vec();
+        let domain = CanonicCoset::new(LOG_DOMAIN).circle_domain();
+        let evals = polys.iter().map(|p| p.evaluate(domain)).collect_vec();
+        let points = [
+            SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+            SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+        ];
+        // Columns sampled at one point, at two (with the periodicity sample), and at one.
+        let samples = |wrong: bool| {
+            TreeVec(vec![polys
+                .iter()
+                .zip([1, 2, 1])
+                .enumerate()
+                .map(|(column, (poly, n_points))| {
+                    points[..n_points]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &point)| PointSample {
+                            point,
+                            value: poly.eval_at_point(point)
+                                + if wrong && column == 1 && i == 0 {
+                                    SecureField::one()
+                                } else {
+                                    SecureField::zero()
+                                },
+                        })
+                        .collect_vec()
+                })
+                .collect_vec()])
+        };
+        assert_eq!(n_deep_values(&samples(false)), 5);
+        let verifier_answers = |samples, coefficients| {
+            fri_answers(
+                TreeVec(vec![vec![LOG_DOMAIN; 3]]),
+                samples,
+                coefficients,
+                &(0..1 << LOG_DOMAIN).collect_vec(),
+                TreeVec(vec![evals.iter().map(|e| e.values.clone()).collect_vec()]),
+                LOG_DOMAIN,
+            )
+            .unwrap()
+        };
+        let degree_bound = |answers: &[SecureField]| {
+            (0..4)
+                .map(|coordinate| {
+                    let column = answers
+                        .iter()
+                        .map(|a| a.to_m31_array()[coordinate])
+                        .collect_vec();
+                    let coeffs = CpuCircleEvaluation::new(domain, column)
+                        .interpolate()
+                        .coeffs;
+                    coeffs
+                        .iter()
+                        .rposition(|c| !c.is_zero())
+                        .map_or(0, |d| d + 1)
+                })
+                .max()
+                .unwrap()
+        };
+        let twiddles = CpuBackend::precompute_twiddles(domain.half_coset);
+        for coefficients in [
+            DeepCoefficients::Powers(random_felt(&mut rng)),
+            DeepCoefficients::Affine((0..4).map(|_| random_felt(&mut rng)).collect()),
+        ] {
+            let right = verifier_answers(samples(false), coefficients.clone());
+            assert!(degree_bound(&right) < 1 << LOG_SIZE);
+            let prover = compute_fri_quotients(
+                &TreeVec(vec![evals.iter().collect_vec()]),
+                &samples(false),
+                coefficients.clone(),
+                LOG_DOMAIN,
+                &twiddles,
+                LOG_BLOWUP_FACTOR,
+            );
+            assert_eq!(prover.values.to_vec(), right);
+            let wrong = verifier_answers(samples(true), coefficients);
+            assert!(degree_bound(&wrong) > 1 << LOG_SIZE);
+        }
+    }
+
+    /// Commits `N_COLS` polynomials on the SIMD backend, proves their values at two points
+    /// (columns sampled once or twice), changes the proof by `tamper`, and verifies it under
+    /// `verifier_batching`.
+    fn prove_and_verify_pcs_with<MC: MerkleChannel>(
+        config: PcsConfig,
+        verifier_batching: DeepBatching,
+        tamper: impl FnOnce(&mut CommitmentSchemeProof<MC::H>),
+    ) -> Result<(), VerificationError>
+    where
+        SimdBackend: BackendForChannel<MC>,
+    {
+        const N_COLS: usize = 10;
+        const LIFTING_LOG_SIZE: u32 = 8;
+
+        let mut channel = MC::C::default();
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(LIFTING_LOG_SIZE + config.fri_config.log_blowup_factor).half_coset(),
+        );
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
+        let polys = prepare_polys::<SimdBackend, N_COLS, LIFTING_LOG_SIZE>();
+        let sizes = polys.iter().map(|poly| poly.log_size()).collect_vec();
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_polys(polys);
+        tree_builder.commit(&mut channel);
+
+        let mut rng = SmallRng::seed_from_u64(0);
+        let mask_structure = (0..N_COLS).map(|_| rng.gen_range(1..=2)).collect_vec();
+        let points = [
+            SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+            SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+        ];
+        let sampled_points = vec![mask_structure
+            .iter()
+            .map(|&n| points.into_iter().take(n).collect_vec())
+            .collect_vec()];
+        let mut proof = commitment_scheme
+            .prove_values(TreeVec(sampled_points.clone()), &mut channel)
+            .proof;
+        tamper(&mut proof);
+
+        let mut channel = MC::C::default();
+        let mut verifier = CommitmentSchemeVerifier::<MC>::new(PcsConfig {
+            deep_batching: verifier_batching,
+            ..config
+        });
+        verifier.commit(proof.commitments[0], &sizes, &mut channel);
+        verifier.verify_values(TreeVec(sampled_points), proof, &mut channel)
+    }
+
+    fn affine(fold_step: u32) -> PcsConfig {
+        PcsConfig {
+            pow_bits: 5,
+            fri_config: FriConfig::new(2, 3, 8, fold_step),
+            lifting_log_size: None,
+            deep_batching: DeepBatching::Affine,
+        }
+    }
+
+    /// A proof under affine batching verifies on the Blake2s and Blake2b channels, at fold
+    /// steps 1 and 3; it fails under powers, as a powers proof fails under affine batching.
+    #[test]
+    fn affine_batching_proves_and_verifies() {
+        for fold_step in [1, 3] {
+            let config = affine(fold_step);
+            prove_and_verify_pcs_with::<Blake2sMerkleChannel>(config, DeepBatching::Affine, |_| {})
+                .unwrap();
+            prove_and_verify_pcs_with::<Blake2bMerkleChannel>(config, DeepBatching::Affine, |_| {})
+                .unwrap();
+            assert!(prove_and_verify_pcs_with::<Blake2bMerkleChannel>(
+                config,
+                DeepBatching::Powers,
+                |_| {}
+            )
+            .is_err());
+            let powers = PcsConfig {
+                deep_batching: DeepBatching::Powers,
+                ..config
+            };
+            prove_and_verify_pcs_with::<Blake2bMerkleChannel>(powers, DeepBatching::Powers, |_| {})
+                .unwrap();
+            assert!(prove_and_verify_pcs_with::<Blake2bMerkleChannel>(
+                powers,
+                DeepBatching::Affine,
+                |_| {}
+            )
+            .is_err());
+        }
+    }
+
+    /// Under affine batching, a changed sampled value (of a column sampled once, of one sampled
+    /// twice) and a changed queried value are refused.
+    #[test]
+    fn affine_batching_refuses_a_tampered_proof() {
+        let config = affine(3);
+        for column in 0..10 {
+            let result = prove_and_verify_pcs_with::<Blake2bMerkleChannel>(
+                config,
+                DeepBatching::Affine,
+                |proof| proof.sampled_values[0][column][0] += SecureField::one(),
+            );
+            assert!(result.is_err(), "column {column}");
+        }
+        let result = prove_and_verify_pcs_with::<Blake2bMerkleChannel>(
+            config,
+            DeepBatching::Affine,
+            |proof| proof.queried_values[0][3][0] += M31::from(1),
+        );
+        assert!(matches!(result, Err(VerificationError::Merkle(_))));
+    }
+
+    /// Affine batching draws `B − 1` coefficients after the sampled values, one each for every
+    /// value but the first, and mixes one more element into the config's transcript; powers
+    /// draw one coefficient and leave the transcript as it was.
+    #[test]
+    fn deep_coefficients_are_drawn_one_a_value() {
+        let mut powers = Blake2sChannel::default();
+        let mut by_affine = powers.clone();
+        let DeepCoefficients::Powers(alpha) =
+            DeepCoefficients::draw(&mut powers, DeepBatching::Powers, 7)
+        else {
+            panic!()
+        };
+        let drawn = DeepCoefficients::draw(&mut by_affine, DeepBatching::Affine, 7);
+        let DeepCoefficients::Affine(coefficients) = &drawn else {
+            panic!()
+        };
+        assert_eq!(coefficients.len(), 6);
+        assert_eq!(
+            drawn.iter().collect_vec(),
+            std::iter::once(SecureField::one())
+                .chain(coefficients.iter().copied())
+                .collect_vec()
+        );
+        assert_eq!(
+            DeepCoefficients::Powers(alpha).iter().take(3).collect_vec(),
+            vec![SecureField::one(), alpha, alpha * alpha]
+        );
+        assert_eq!(
+            DeepCoefficients::from(alpha),
+            DeepCoefficients::Powers(alpha)
+        );
+
+        let config = affine(1);
+        let mix = |config: PcsConfig| {
+            let mut channel = Blake2sChannel::default();
+            config.mix_into(&mut channel);
+            channel.digest()
+        };
+        let powers_config = PcsConfig {
+            deep_batching: DeepBatching::Powers,
+            ..config
+        };
+        assert_ne!(mix(config), mix(powers_config));
+        let mut channel = Blake2sChannel::default();
+        channel.mix_felts(&[
+            SecureField::from_u32_unchecked(5, 3, 8, 2),
+            SecureField::from_u32_unchecked(1, 0, 0, 0),
+        ]);
+        assert_eq!(mix(powers_config), channel.digest());
     }
 }

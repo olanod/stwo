@@ -192,7 +192,7 @@ mod tests {
         let config = PcsConfig {
             pow_bits: 0,
             fri_config: FriConfig::new(0, 1, 64, 1),
-            lifting_log_size: None,
+            ..Default::default()
         };
         let twiddles = SimdBackend::precompute_twiddles(
             CanonicCoset::new(log_n_rows + 1 + config.fri_config.log_blowup_factor)
