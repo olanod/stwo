@@ -180,8 +180,11 @@ impl<MC: MerkleChannel> FriVerifier<MC> {
         let last_layer_domain = layer_domain;
         let last_layer_poly = proof.last_layer_poly;
 
-        if last_layer_poly.len() > (1 << config.log_last_layer_degree_bound) {
-            return Err(FriVerificationError::LastLayerDegreeInvalid);
+        // The polynomial comes from the proof: its coefficient count is checked against its
+        // stated size before anything reads either.
+        match last_layer_poly.checked_log_size() {
+            Some(log_size) if log_size <= config.log_last_layer_degree_bound => {}
+            _ => return Err(FriVerificationError::LastLayerDegreeInvalid),
         }
 
         channel.mix_felts(&last_layer_poly);
@@ -215,7 +218,7 @@ impl<MC: MerkleChannel> FriVerifier<MC> {
         self.decommit_on_queries(&queries, first_layer_query_evals)
     }
 
-    fn decommit_on_queries(
+    pub(crate) fn decommit_on_queries(
         self,
         queries: &Queries,
         first_layer_query_evals: Vec<SecureField>,

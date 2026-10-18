@@ -187,6 +187,26 @@ Risk: SOUNDNESS (for Blake example only — constraints may be under-specified)
 Status: OPEN
 Notes: Example code only, but users may copy patterns from examples.
 
+### DIVERGENCE-011: The First FRI Round Folds by the Fold Step
+
+Paper: `.agents/papers/llm/Stwo_Whitepaper.llm.md` — `prot:cFRI:multi`; and the
+round-by-round FRI soundness accounting (soundcalc `pcs/fri.py`,
+`_get_commit_phase_error`: `(f - 1) · ε_lin(k / F_i)` for a round of factor `f`).
+
+Code: `crates/stwo/src/core/fri.rs` (`FriVerifier::commit`, `SparseEvaluation::fold_circle`)
+and `crates/stwo/src/prover/fri.rs` (`commit_inner_layers`) — the first layer folds the
+circle to the line with `α` and then folds the line `fold_step - 1` times with `α², α⁴, …`,
+before the next commitment: one round of factor `2^fold_step`, the circle fold included.
+Inner layers then fold by `fold_step` each, the last by what remains.
+
+Type: Intentional deviation (one commitment saved)
+Risk: SOUNDNESS ACCOUNTING — a model that counts the circle fold as its own round of
+factor 2 and the line folds after it in rounds of `2^fold_step` undercounts the first
+round's error: `(2^s - 1)·ε_lin(k/2^s)` against `ε_lin(k/2)` and `(2^s - 1)·ε_lin(k/2^(s+1))`.
+For fold step 3 that is about 0.8 bits on the fold term.
+Status: OPEN
+Notes: Tamper tests at fold step 3 in `prover/fri.rs` (`fold_step_3_tests`).
+
 ## Resolved Divergences
 
 ### DIVERGENCE-005 (see above)

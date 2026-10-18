@@ -640,3 +640,316 @@ mod tests {
         }
     }
 }
+
+/// Fold step 3, as the final wrap uses it: each check a cheating prover can reach refuses at the
+/// layer it belongs to. The column is a random polynomial of degree bound `2^12` at blowup 4, so
+/// FRI folds the circle and two lines into a line of degree bound `2^9` (first layer, packed
+/// leaves), then `2^6` and `2^3` (inner layers 0 and 1, packed), then `2^2` (inner layer 2, one
+/// fold, unpacked leaves), the last layer.
+#[cfg(test)]
+mod fold_step_3_tests {
+    use num_traits::One;
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+
+    use super::{squared_alpha_powers, FriFirstLayerProver, FriInnerLayerProver, FriOps};
+    use crate::core::channel::{Blake2bChannel, Channel, MerkleChannel};
+    use crate::core::fields::m31::BaseField;
+    use crate::core::fields::qm31::SecureField;
+    use crate::core::fri::{
+        CirclePolyDegreeBound, FriConfig, FriLayerProof, FriProof, FriVerificationError,
+    };
+    use crate::core::poly::circle::CanonicCoset;
+    use crate::core::poly::line::LinePoly;
+    use crate::core::queries::Queries;
+    use crate::core::vcs::blake2b_hash::Blake2bHash;
+    use crate::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
+    use crate::core::vcs_lifted::verifier::MerkleVerificationError;
+    use crate::prover::backend::cpu::CpuCirclePoly;
+    use crate::prover::backend::CpuBackend;
+    use crate::prover::poly::circle::{PolyOps, SecureEvaluation};
+    use crate::prover::poly::twiddles::TwiddleTree;
+    use crate::prover::poly::BitReversedOrder;
+
+    type MC = Blake2bMerkleChannel;
+    type FriProver<'a> = super::FriProver<'a, CpuBackend, MC>;
+    type FriVerifier = crate::core::fri::FriVerifier<MC>;
+    type Column = SecureEvaluation<CpuBackend, BitReversedOrder>;
+
+    const LOG_DEGREE: u32 = 12;
+    const LOG_BLOWUP: u32 = 2;
+    const CONFIG: FriConfig = FriConfig {
+        log_blowup_factor: LOG_BLOWUP,
+        log_last_layer_degree_bound: 2,
+        n_queries: 3,
+        fold_step: 3,
+    };
+    /// Positions in the first layer's domain of `2^14`; 4 and 7 share a coset of 8.
+    const POSITIONS: [usize; 4] = [4, 7, 5000, 16000];
+
+    fn column() -> (Column, TwiddleTree<CpuBackend>) {
+        let mut rng = SmallRng::seed_from_u64(3);
+        let poly = CpuCirclePoly::new(
+            (0..1 << LOG_DEGREE)
+                .map(|_| BaseField::from(rng.gen_range(0..1u32 << 30)))
+                .collect(),
+        );
+        let domain = CanonicCoset::new(LOG_DEGREE + LOG_BLOWUP).circle_domain();
+        let column = SecureEvaluation::new(
+            domain,
+            poly.evaluate(domain)
+                .into_iter()
+                .map(SecureField::from)
+                .collect(),
+        );
+        let twiddles = CpuBackend::precompute_twiddles(domain.half_coset);
+        (column, twiddles)
+    }
+
+    fn queries() -> Queries {
+        Queries::from_positions(POSITIONS.to_vec(), LOG_DEGREE + LOG_BLOWUP)
+    }
+
+    /// The first-layer values at the queries: the DEEP answers an honest PCS hands FRI.
+    fn answers(column: &Column) -> Vec<SecureField> {
+        queries().iter().map(|&p| column.at(p)).collect()
+    }
+
+    /// [`super::FriProver::commit`], except that inner layer `bad_layer`'s committed values at
+    /// the given positions are changed by one; the next layer is folded from the honest values.
+    /// Every root is mixed and every alpha drawn as in an honest proof, and every Merkle path
+    /// opens what was committed: only the fold into the bad layer disagrees with it.
+    fn commit_with_bad_layer<'a>(
+        column: &'a Column,
+        twiddles: &TwiddleTree<CpuBackend>,
+        bad_layer: usize,
+        bad_positions: &[usize],
+    ) -> FriProver<'a> {
+        let channel = &mut Blake2bChannel::default();
+        let first_layer = FriFirstLayerProver::new(column, CONFIG.fold_step);
+        MC::mix_root(channel, first_layer.merkle_tree.root());
+        let alpha = channel.draw_secure_felt();
+        let line = CpuBackend::fold_circle_into_line(column, alpha, twiddles);
+        let mut evaluation = CpuBackend::fold_line(
+            &line,
+            &squared_alpha_powers(alpha * alpha, CONFIG.fold_step - 1),
+            twiddles,
+        );
+        let last_log_size = CONFIG.last_layer_domain_size().ilog2();
+        let mut inner_layers = Vec::new();
+        while evaluation.domain().log_size() > last_log_size {
+            let step = CONFIG
+                .fold_step
+                .min(evaluation.domain().log_size() - last_log_size);
+            let mut committed = evaluation.clone();
+            if inner_layers.len() == bad_layer {
+                for &position in bad_positions {
+                    let value = committed.values.at(position) + SecureField::one();
+                    committed.values.set(position, value);
+                }
+            }
+            let layer = FriInnerLayerProver::new(committed, step);
+            MC::mix_root(channel, layer.merkle_tree.root());
+            let alpha = channel.draw_secure_felt();
+            evaluation =
+                CpuBackend::fold_line(&evaluation, &squared_alpha_powers(alpha, step), twiddles);
+            inner_layers.push(layer);
+        }
+        let last_layer_poly = FriProver::commit_last_layer(channel, CONFIG, evaluation);
+        super::FriProver {
+            config: CONFIG,
+            first_layer,
+            inner_layers,
+            last_layer_poly,
+        }
+    }
+
+    fn honest_proof(
+        column: &Column,
+        twiddles: &TwiddleTree<CpuBackend>,
+    ) -> FriProof<<MC as MerkleChannel>::H> {
+        FriProver::commit(&mut Blake2bChannel::default(), CONFIG, column, twiddles)
+            .decommit_on_queries(&queries())
+            .proof
+    }
+
+    fn verify(
+        proof: FriProof<<MC as MerkleChannel>::H>,
+        answers: Vec<SecureField>,
+    ) -> Result<(), FriVerificationError> {
+        let bound = CirclePolyDegreeBound::new(LOG_DEGREE);
+        FriVerifier::commit(&mut Blake2bChannel::default(), CONFIG, proof, bound)?
+            .decommit_on_queries(&queries(), answers)
+    }
+
+    /// The query positions in inner layer `layer`'s domain.
+    fn layer_positions(layer: usize) -> Vec<usize> {
+        let mut queries = queries().fold(CONFIG.fold_step);
+        for _ in 0..layer {
+            queries = queries.fold(CONFIG.fold_step);
+        }
+        queries.positions
+    }
+
+    #[test]
+    fn the_honest_proof_verifies_with_the_expected_layers() {
+        let (column, twiddles) = column();
+        let proof = honest_proof(&column, &twiddles);
+        assert_eq!(proof.inner_layers.len(), 3);
+        assert_eq!(
+            proof.last_layer_poly.len(),
+            1 << CONFIG.log_last_layer_degree_bound
+        );
+        verify(proof, answers(&column)).unwrap();
+        // The cheating prover's construction, with nothing changed, is the honest proof.
+        let unchanged = commit_with_bad_layer(&column, &twiddles, usize::MAX, &[])
+            .decommit_on_queries(&queries())
+            .proof;
+        verify(unchanged, answers(&column)).unwrap();
+    }
+
+    /// A committed value that is not the fold of the layer before it, at a queried position, is
+    /// refused by that layer's opening, where the verifier's own fold stands in for it: after
+    /// the circle fold and two line folds (inner layer 0), after three line folds (inner layer
+    /// 1) and after one (inner layer 2).
+    #[test]
+    fn a_changed_folded_value_is_refused_at_its_layer() {
+        let (column, twiddles) = column();
+        for layer in 0..3 {
+            let positions = layer_positions(layer);
+            let proof = commit_with_bad_layer(&column, &twiddles, layer, &positions[..1])
+                .decommit_on_queries(&queries())
+                .proof;
+            assert!(
+                matches!(
+                    verify(proof, answers(&column)),
+                    Err(FriVerificationError::InnerLayerCommitmentInvalid {
+                        inner_layer,
+                        error: MerkleVerificationError::RootMismatch,
+                    }) if inner_layer == layer
+                ),
+                "layer {layer}"
+            );
+        }
+    }
+
+    /// The same change at a position no query reaches goes unseen: the check is the fold at
+    /// the queries, so the queries' number sets its soundness.
+    #[test]
+    fn a_changed_value_off_the_queries_is_not_opened() {
+        let (column, twiddles) = column();
+        let queried = layer_positions(1);
+        let unqueried = (0..1 << 9)
+            .find(|p| queried.iter().all(|q| q >> 3 != p >> 3))
+            .unwrap();
+        let proof = commit_with_bad_layer(&column, &twiddles, 1, &[unqueried])
+            .decommit_on_queries(&queries())
+            .proof;
+        verify(proof, answers(&column)).unwrap();
+    }
+
+    /// DEEP answers other than the committed first layer are refused by its opening.
+    #[test]
+    fn a_wrong_first_layer_answer_is_refused() {
+        let (column, twiddles) = column();
+        let mut answers = answers(&column);
+        answers[2] += SecureField::one();
+        assert!(matches!(
+            verify(honest_proof(&column, &twiddles), answers),
+            Err(FriVerificationError::FirstLayerCommitmentInvalid {
+                error: MerkleVerificationError::RootMismatch
+            })
+        ));
+    }
+
+    /// A packed leaf holds 4 adjacent values of a coset of 8: a changed value, two values of
+    /// one leaf swapped, a changed sibling hash, and a witness value too few or too many are each
+    /// refused, in the first layer and in a packed inner layer.
+    #[test]
+    fn a_wrong_packed_leaf_is_refused() {
+        let (column, twiddles) = column();
+        type Tamper = fn(&mut FriLayerProof<Blake2bMerkleHasher>);
+        let tampers: [(&str, Tamper); 3] = [
+            ("changed value", |layer| {
+                layer.fri_witness[0] += SecureField::one()
+            }),
+            ("swapped values", |layer| layer.fri_witness.swap(0, 1)),
+            ("changed sibling", |layer| {
+                layer.decommitment.hash_witness[0] = Blake2bHash([7; 32])
+            }),
+        ];
+        for (name, tamper) in tampers {
+            let mut proof = honest_proof(&column, &twiddles);
+            tamper(&mut proof.first_layer);
+            assert!(
+                matches!(
+                    verify(proof, answers(&column)),
+                    Err(FriVerificationError::FirstLayerCommitmentInvalid { .. })
+                ),
+                "first layer, {name}"
+            );
+            let mut proof = honest_proof(&column, &twiddles);
+            tamper(&mut proof.inner_layers[1]);
+            assert!(
+                matches!(
+                    verify(proof, answers(&column)),
+                    Err(FriVerificationError::InnerLayerCommitmentInvalid { inner_layer: 1, .. })
+                ),
+                "inner layer, {name}"
+            );
+        }
+        let mut proof = honest_proof(&column, &twiddles);
+        proof.first_layer.fri_witness.pop();
+        assert!(matches!(
+            verify(proof, answers(&column)),
+            Err(FriVerificationError::FirstLayerEvaluationsInvalid)
+        ));
+        let mut proof = honest_proof(&column, &twiddles);
+        proof.inner_layers[1].fri_witness.push(SecureField::one());
+        assert!(matches!(
+            verify(proof, answers(&column)),
+            Err(FriVerificationError::InnerLayerEvaluationsInvalid { inner_layer: 1 })
+        ));
+    }
+
+    /// The last layer: a changed coefficient, a polynomial of a higher degree bound, a
+    /// coefficient count other than the stated size (refused, not a panic), and a missing inner
+    /// layer.
+    #[test]
+    fn a_wrong_last_layer_is_refused() {
+        let (column, twiddles) = column();
+        let mut proof = honest_proof(&column, &twiddles);
+        proof.last_layer_poly[1] += SecureField::one();
+        assert!(matches!(
+            verify(proof, answers(&column)),
+            Err(FriVerificationError::LastLayerEvaluationsInvalid)
+        ));
+
+        let mut proof = honest_proof(&column, &twiddles);
+        proof.last_layer_poly = LinePoly::new(vec![SecureField::one(); 8]);
+        assert!(matches!(
+            verify(proof, answers(&column)),
+            Err(FriVerificationError::LastLayerDegreeInvalid)
+        ));
+
+        for (len, log_size) in [(3, 2), (4, 1), (1, 64), (2, 65)] {
+            let mut proof = honest_proof(&column, &twiddles);
+            proof.last_layer_poly =
+                LinePoly::from_raw_parts(vec![SecureField::one(); len], log_size);
+            assert!(
+                matches!(
+                    verify(proof, answers(&column)),
+                    Err(FriVerificationError::LastLayerDegreeInvalid)
+                ),
+                "{len} coefficients, log size {log_size}"
+            );
+        }
+
+        let mut proof = honest_proof(&column, &twiddles);
+        proof.inner_layers.pop();
+        assert!(matches!(
+            verify(proof, answers(&column)),
+            Err(FriVerificationError::InvalidNumFriLayers)
+        ));
+    }
+}

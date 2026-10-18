@@ -134,6 +134,21 @@ impl LinePoly {
         Self { coeffs, log_size }
     }
 
+    /// `log2` of the number of coefficients, `None` unless there are exactly `2^log_size` of
+    /// them. [`Self::new`] ensures it; a deserialized polynomial carries both fields as sent, and
+    /// [`Self::len`] and [`Self::eval_at_point`] assume it.
+    pub fn checked_log_size(&self) -> Option<u32> {
+        let len = 1usize.checked_shl(self.log_size)?;
+        (self.coeffs.len() == len).then_some(self.log_size)
+    }
+
+    /// A polynomial with `log_size` not checked against the coefficients, as deserialization
+    /// can produce.
+    #[cfg(test)]
+    pub(crate) const fn from_raw_parts(coeffs: Vec<SecureField>, log_size: u32) -> Self {
+        Self { coeffs, log_size }
+    }
+
     /// Evaluates the polynomial at a single point.
     pub fn eval_at_point(&self, mut x: SecureField) -> SecureField {
         let mut doublings = Vec::new();
