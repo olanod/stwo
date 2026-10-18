@@ -144,7 +144,7 @@ impl LinePoly {
 
     /// A polynomial with `log_size` not checked against the coefficients, as deserialization
     /// can produce.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "prover"))]
     pub(crate) const fn from_raw_parts(coeffs: Vec<SecureField>, log_size: u32) -> Self {
         Self { coeffs, log_size }
     }
