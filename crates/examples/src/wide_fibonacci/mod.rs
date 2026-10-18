@@ -371,6 +371,67 @@ mod tests {
         }
     }
 
+    /// A proof on the Blake2b-256 channel, at the final wrap's blowup, fold step and last layer.
+    #[test]
+    fn test_wide_fib_prove_with_blake2b() {
+        use stwo::core::channel::Blake2bChannel;
+        use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
+
+        // The composition's degree bound is 2^13: FRI folds to 2^10 (circle and two line folds),
+        // 2^7, then 2^6, the last layer.
+        const LOG_N_INSTANCES: u32 = 12;
+        let config = PcsConfig {
+            pow_bits: 10,
+            fri_config: FriConfig::new(6, 6, 20, 3),
+            ..Default::default()
+        };
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(LOG_N_INSTANCES + 1 + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+        let prover_channel = &mut Blake2bChannel::default();
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<SimdBackend, Blake2bMerkleChannel>::new(config, &twiddles);
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(vec![]);
+        tree_builder.commit(prover_channel);
+        let trace =
+            generate_trace::<FIB_SEQUENCE_LENGTH, _>(&generate_test_inputs(LOG_N_INSTANCES));
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(trace);
+        tree_builder.commit(prover_channel);
+        let component = WideFibonacciComponent::new(
+            &mut TraceLocationAllocator::default(),
+            WideFibonacciEval::<FIB_SEQUENCE_LENGTH> {
+                log_n_rows: LOG_N_INSTANCES,
+            },
+            SecureField::zero(),
+        );
+        let proof = prove::<SimdBackend, Blake2bMerkleChannel>(
+            &[&component],
+            prover_channel,
+            commitment_scheme,
+        )
+        .unwrap();
+
+        let verify_with = |proof: stwo::core::proof::StarkProof<_>| {
+            let verifier_channel = &mut Blake2bChannel::default();
+            let commitment_scheme =
+                &mut CommitmentSchemeVerifier::<Blake2bMerkleChannel>::new(config);
+            let sizes = component.trace_log_degree_bounds();
+            commitment_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
+            commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
+            verify(&[&component], verifier_channel, commitment_scheme, proof)
+        };
+        verify_with(proof.clone()).unwrap();
+
+        // A changed query answer in the trace is refused by its Merkle path.
+        let mut tampered = proof;
+        tampered.0.queried_values[1][0][0] += BaseField::one();
+        assert!(verify_with(tampered).is_err());
+    }
+
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn test_wide_fib_prove_with_poseidon() {

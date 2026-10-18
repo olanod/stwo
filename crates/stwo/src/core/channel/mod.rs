@@ -10,6 +10,9 @@ mod poseidon252;
 #[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 pub use poseidon252::Poseidon252Channel;
 
+pub mod blake2b;
+pub use blake2b::Blake2bChannel;
+
 mod blake2s;
 pub use blake2s::{Blake2sChannel, Blake2sChannelGeneric, Blake2sM31Channel};
 

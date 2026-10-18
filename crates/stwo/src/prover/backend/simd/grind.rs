@@ -8,10 +8,11 @@ use rayon::prelude::*;
 use tracing::{span, Level};
 
 use super::SimdBackend;
-use crate::core::channel::{Blake2sChannelGeneric, Channel, Keccak256Channel};
+use crate::core::channel::{Blake2bChannel, Blake2sChannelGeneric, Channel, Keccak256Channel};
 use crate::core::fields::m31::P;
 use crate::core::proof_of_work::GrindOps;
 use crate::core::vcs::blake2_hash::Blake2sHasherGeneric;
+use crate::core::vcs::blake2b_hash::Blake2bHash;
 use crate::prover::backend::simd::blake2s::hash_16;
 use crate::prover::backend::simd::m31::{PackedM31, N_LANES};
 
@@ -139,6 +140,35 @@ where
     found.expect("Grind failed to find a solution.")
 }
 
+impl GrindOps<Blake2bChannel> for SimdBackend {
+    /// Outputs the smallest nonce of the form `(a << 32) | b`, where `0 <= a < 2^31 - 1` and
+    /// `0 <= b < 2^GRIND_LOW_BITS`, scanning `b` with scalar hashes, `a` across threads.
+    fn grind(channel: &Blake2bChannel, pow_bits: u32) -> u64 {
+        let _span = span!(Level::TRACE, "Blake2b Grind", class = "Blake2b Grind");
+        let prefix = channel.pow_prefix(pow_bits);
+
+        #[cfg(not(feature = "parallel"))]
+        let res = (0..)
+            .find_map(|hi| grind_blake2b(prefix, hi, pow_bits))
+            .expect("Grind failed to find a solution.");
+
+        #[cfg(feature = "parallel")]
+        let res = parallel_grind(prefix, pow_bits, grind_blake2b);
+
+        assert!(
+            ((res >> 32) as u32) < P,
+            "The 32 high bits of the nonce are not reduced modulo the M31 prime."
+        );
+        res
+    }
+}
+
+fn grind_blake2b(prefix: Blake2bHash, hi: u32, pow_bits: u32) -> Option<u64> {
+    (0..1u64 << GRIND_LOW_BITS)
+        .map(|low| ((hi as u64) << 32) | low)
+        .find(|&nonce| Blake2bChannel::pow_nonce_passes(&prefix, pow_bits, nonce))
+}
+
 // TODO: replace with an optimized SIMD implementation using parallel keccak permutations
 // (e.g. `keccak::parallel` `f1600x4`/`x8`), similar to the parallel + SIMD path used for
 // `Blake2sChannelGeneric` above.
@@ -250,6 +280,16 @@ mod tests {
             .collect_vec();
 
         assert!(results.iter().all(|r| r == &results[0]));
+    }
+
+    #[test]
+    fn test_grind_blake2b() {
+        let pow_bits = 12;
+        let mut channel = Blake2bChannel::default();
+        channel.mix_u64(0x1111222233334344);
+        let nonce = SimdBackend::grind(&channel, pow_bits);
+        assert!(channel.verify_pow_nonce(pow_bits, nonce));
+        test_grind_is_deterministic::<Blake2bChannel>();
     }
 
     #[test]

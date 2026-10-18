@@ -1,4 +1,5 @@
 pub mod blake2_merkle;
+pub mod blake2b_merkle;
 pub mod keccak256_merkle;
 pub mod merkle_hasher;
 #[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]

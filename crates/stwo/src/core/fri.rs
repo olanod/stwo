@@ -946,6 +946,40 @@ mod tests {
     }
 
     #[test]
+    fn valid_proof_passes_verification_blake2b() {
+        use crate::core::channel::Blake2bChannel;
+        use crate::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
+
+        const LOG_DEGREE: u32 = 9;
+        let column = polynomial_evaluation(LOG_DEGREE, LOG_BLOWUP_FACTOR);
+        let twiddles = CpuBackend::precompute_twiddles(column.domain.half_coset);
+        let queries = Queries::from_positions(vec![5, 600, 1001], column.domain.log_size());
+        for fold_step in [1, 3] {
+            let config = FriConfig::new(2, LOG_BLOWUP_FACTOR, queries.len(), fold_step);
+            let decommitment_value = query_polynomial(&column, &queries);
+            let prover =
+                crate::prover::fri::FriProver::<'_, CpuBackend, Blake2bMerkleChannel>::commit(
+                    &mut Blake2bChannel::default(),
+                    config,
+                    &column,
+                    &twiddles,
+                );
+            let proof = prover.decommit_on_queries(&queries).proof;
+            let bound = CirclePolyDegreeBound::new(LOG_DEGREE);
+            let verifier = super::FriVerifier::<Blake2bMerkleChannel>::commit(
+                &mut Blake2bChannel::default(),
+                config,
+                proof,
+                bound,
+            )
+            .unwrap();
+            verifier
+                .decommit_on_queries(&queries, decommitment_value)
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn valid_proof_with_constant_last_layer_passes_verification() -> Result<(), FriVerificationError>
     {
         const LOG_DEGREE: u32 = 3;

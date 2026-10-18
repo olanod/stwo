@@ -2,12 +2,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{Backend, BackendForChannel};
 use crate::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
+use crate::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use crate::core::vcs_lifted::keccak256_merkle::Keccak256MerkleChannel;
 #[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]
 use crate::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
 
 pub mod accumulation;
 pub mod bit_reverse;
+pub mod blake2b;
 pub mod blake2s;
 pub mod blake2s_lifted;
 #[cfg(test)]
@@ -39,6 +41,7 @@ pub struct SimdBackend;
 
 impl Backend for SimdBackend {}
 impl BackendForChannel<Blake2sMerkleChannel> for SimdBackend {}
+impl BackendForChannel<Blake2bMerkleChannel> for SimdBackend {}
 impl BackendForChannel<Blake2sM31MerkleChannel> for SimdBackend {}
 impl BackendForChannel<Keccak256MerkleChannel> for SimdBackend {}
 #[cfg(all(not(target_arch = "wasm32"), feature = "poseidon252"))]

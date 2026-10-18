@@ -238,6 +238,32 @@ mod tests {
     }
 
     #[test]
+    fn test_merkle_blake2b() {
+        use crate::core::vcs::blake2b_hash::Blake2bHash;
+        use crate::core::vcs_lifted::blake2b_merkle::Blake2bMerkleHasher;
+
+        let (queries, decommitment, values, verifier) = prepare_merkle::<Blake2bMerkleHasher>();
+        verifier
+            .verify(&queries, values.clone(), decommitment.clone())
+            .unwrap();
+
+        let mut tampered = values.clone();
+        tampered[0][2] = BaseField::zero();
+        assert_eq!(
+            verifier
+                .verify(&queries, tampered, decommitment.clone())
+                .unwrap_err(),
+            MerkleVerificationError::RootMismatch
+        );
+        let mut witness = decommitment;
+        witness.hash_witness[4] = Blake2bHash::default();
+        assert_eq!(
+            verifier.verify(&queries, values, witness).unwrap_err(),
+            MerkleVerificationError::RootMismatch
+        );
+    }
+
+    #[test]
     fn test_merkle_invalid_witness() {
         let (queries, mut decommitment, values, verifier) = prepare_merkle::<Blake2sMerkleHasher>();
         decommitment.hash_witness[4] = Blake2sHash::default();
