@@ -1,4 +1,5 @@
-use num_traits::One;
+use num_traits::{One, Zero};
+use std_shims::ToString;
 
 use super::circle::{CirclePoint, Coset};
 use super::fields::m31::BaseField;
@@ -7,6 +8,7 @@ use super::fields::ExtensionOf;
 use super::pcs::quotients::PointSample;
 use crate::core::fields::ComplexConjugate;
 use crate::core::poly::circle::CanonicCoset;
+use crate::core::verifier::VerificationError;
 
 /// Evaluates a vanishing polynomial of the coset at a point.
 pub fn coset_vanishing<F: ExtensionOf<BaseField>>(coset: Coset, mut p: CirclePoint<F>) -> F {
@@ -116,21 +118,26 @@ pub fn complex_conjugate_line(
 /// Specifically, `a, b, and c, s.t. a*x + b -c*y = 0` for (x,y) being (sample.y, sample.value) and
 /// (conj(sample.y), conj(sample.value)). Relies on the fact that every polynomial F over the base
 /// field holds: `F(p*) == F(p)*` (`*` being the complex conjugate).
+///
+/// # Errors
+///
+/// [`VerificationError::InvalidStructure`] when the sample point's `y` is its own conjugate (an
+/// element of CM31): the point and its conjugate share `y`, so no such line exists. A random
+/// sample point is one with probability about 2^-62; the error leaves the verifier refusing the
+/// proof where it would otherwise panic.
 pub fn complex_conjugate_line_coeffs(
     sample: &PointSample,
     alpha: SecureField,
-) -> (SecureField, SecureField, SecureField) {
-    // TODO(AlonH): This assertion will fail at a probability of 1 to 2^62. Use a better solution.
-    assert_ne!(
-        sample.point.y,
-        sample.point.y.complex_conjugate(),
-        "Cannot evaluate a line with a single point ({:?}).",
-        sample.point
-    );
-    let a = sample.value.complex_conjugate() - sample.value;
+) -> Result<(SecureField, SecureField, SecureField), VerificationError> {
     let c = sample.point.complex_conjugate().y - sample.point.y;
+    if c.is_zero() {
+        return Err(VerificationError::InvalidStructure(ToString::to_string(
+            "a sample point's y is its own conjugate",
+        )));
+    }
+    let a = sample.value.complex_conjugate() - sample.value;
     let b = sample.value * c - a * sample.point.y;
-    (alpha * a, alpha * b, alpha * c)
+    Ok((alpha * a, alpha * b, alpha * c))
 }
 
 #[cfg(test)]

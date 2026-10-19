@@ -10,7 +10,7 @@ description: >
 
 # Paper-Implementation Divergence Log
 
-Last analyzed: 2026-03-05
+Last analyzed: 2026-10-19
 
 ## Canonical Theory Sources
 
@@ -224,6 +224,31 @@ to `ε` (affine spaces, BCIKS20 Thm 1.6), as soundcalc `2af5e7df` counts it. The
 not serialized: a verifier must set it from its own configuration, never from a proof.
 Status: OPEN (needs cryptographer review of the citation and the count)
 Notes: Tests in `prover/pcs/quotient_ops.rs` and the wide-Fibonacci example.
+
+### DIVERGENCE-013: The DEEP Quotient's Degenerate Lines Refused, Not Asserted
+
+Paper: `.agents/papers/llm/Stwo_Whitepaper.llm.md` — the DEEP quotient divides each sampled
+column by the line through the sample point z and its conjugate z̄, evaluated at the queried
+point; the protocol assumes z̄ ≠ z (z.y outside CM31) and the line nonzero at every domain point.
+
+Code: `crates/stwo/src/core/constraints.rs` (`complex_conjugate_line_coeffs`) and
+`crates/stwo/src/core/pcs/quotients.rs` (`denominator_inverses`, `column_line_coeffs`,
+`quotient_constants`, `accumulate_row_quotients`, `fri_answers`) — upstream asserts
+`z.y ≠ conj(z.y)` (`assert_ne!`, the TODO's 2^-62) and inverts the line's values with
+`CM31::batch_inverse`, which asserts on zero. Here both return
+`VerificationError::InvalidStructure`, which `fri_answers` passes to `verify_values`; the
+prover's callers (`prover/backend/{cpu,simd}/quotients.rs`) `expect` them, panicking where
+upstream asserted.
+
+Type: Intentional deviation (robustness: a verifier refuses, never panics)
+Risk: NEUTRAL — the accepted set is unchanged: a proof that reached either assert was never
+accepted. z.y in CM31 is about 2^-62 a draw of z (the channel's, so a prover grinds it); a zero
+line at a point of the base field's circle needs `Im(z)` isotropic and nonzero, which no point of
+the QM31 circle has (the proof is in `denominator_inverses`' doc), so for z on the circle only
+the first is reachable. Points off the circle reach the second (the unit test's).
+Status: OPEN
+Notes: Unit tests in `core/pcs/quotients.rs` (`a_sample_point_with_y_in_cm31_is_refused`,
+`a_conjugate_line_through_the_queried_point_is_refused`), each from a constructed point.
 
 ## Resolved Divergences
 

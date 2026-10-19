@@ -28,7 +28,8 @@ impl QuotientOps for CpuBackend {
     ) {
         let size = columns[0].len();
         let subdomain_size = size >> log_blowup_factor;
-        let quotient_constants = quotient_constants(sample_batches);
+        let quotient_constants =
+            quotient_constants(sample_batches).expect("the sample points are off CM31");
 
         for (batch, coeffs) in zip(sample_batches, quotient_constants.line_coeffs) {
             let mut partial_numerators_acc =
@@ -64,7 +65,8 @@ impl QuotientOps for CpuBackend {
         // Populate `quotients` on the subdomain.
         for row in 0..quotients.len() {
             let domain_point = eval_subdomain.at(bit_reverse_index(row, subdomain_log_size));
-            let inverses = denominator_inverses(&sample_points, domain_point);
+            let inverses = denominator_inverses(&sample_points, domain_point)
+                .expect("a circle point's conjugate line misses the base field's circle");
             let mut quotient = SecureField::zero();
             for (acc, den_inv) in accumulations.iter().zip_eq(inverses) {
                 let mut full_numerator = SecureField::zero();

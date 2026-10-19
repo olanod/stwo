@@ -64,7 +64,8 @@ impl QuotientOps for SimdBackend {
             return;
         }
 
-        let quotient_constants = quotient_constants(sample_batches);
+        let quotient_constants =
+            quotient_constants(sample_batches).expect("the sample points are off CM31");
         for (batch, coeffs) in zip(sample_batches, quotient_constants.line_coeffs) {
             let subdomain_acc =
                 accumulate_numerators_on_subdomain(subdomain, batch, columns, &coeffs);

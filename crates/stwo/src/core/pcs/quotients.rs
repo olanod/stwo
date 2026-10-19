@@ -4,7 +4,7 @@ use core::ops::Add;
 use itertools::{izip, zip_eq, Either, Itertools};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
-use std_shims::Vec;
+use std_shims::{ToString, Vec};
 
 use super::{DeepBatching, TreeVec};
 use crate::core::channel::Channel;
@@ -146,7 +146,7 @@ pub fn fri_answers(
         ColumnSampleBatch::new_vec(&samples_with_randomness.iter().flatten().collect::<Vec<_>>());
     let lifting_domain = CanonicCoset::new(lifting_log_size).circle_domain();
     // Compute the quotient constants for all batches.
-    let quotient_constants = quotient_constants(&sample_batches);
+    let quotient_constants = quotient_constants(&sample_batches)?;
     let mut res = Vec::with_capacity(query_positions.len());
     for (idx, position) in query_positions.iter().enumerate() {
         let queried_values_at_row = queried_values.iter().map(|col| col[idx]).collect_vec();
@@ -157,7 +157,7 @@ pub fn fri_answers(
             &queried_values_at_row,
             &quotient_constants,
             domain_point,
-        ));
+        )?);
     }
     Ok(res)
 }
@@ -167,9 +167,9 @@ pub fn accumulate_row_quotients(
     queried_values_at_row: &[BaseField],
     quotient_constants: &QuotientConstants,
     domain_point: CirclePoint<BaseField>,
-) -> SecureField {
+) -> Result<SecureField, VerificationError> {
     let sample_points = sample_batches.iter().map(|b| b.point).collect_vec();
-    let denominator_inverses = denominator_inverses(&sample_points, domain_point);
+    let denominator_inverses = denominator_inverses(&sample_points, domain_point)?;
     let mut row_accumulator = SecureField::zero();
     for (sample_batch, line_coeffs, denominator_inverse) in izip!(
         sample_batches,
@@ -194,7 +194,7 @@ pub fn accumulate_row_quotients(
         // function `denominator_inverses`).
         row_accumulator += numerator.mul_cm31(denominator_inverse);
     }
-    row_accumulator
+    Ok(row_accumulator)
 }
 
 /// Computes the sum
@@ -216,6 +216,9 @@ pub fn accumulate_row_partial_numerators(
     numerator
 }
 
+/// A column's line coefficients `(a, b, c)` in a sample batch ([`column_line_coeffs`]).
+pub type LineCoeffs = (SecureField, SecureField, SecureField);
+
 /// Precomputes the complex conjugate line coefficients for each column in each sample batch.
 ///
 /// For the `i`-th numerator term `curr_coeff_power * alpha^i * (c * F(p) - (a * p.y + b))`,
@@ -223,9 +226,13 @@ pub fn accumulate_row_partial_numerators(
 /// alpha^i * b`, `curr_coeff_power * alpha^i * c`). The index `i` is zero-based and runs
 /// monotonically across all sample batches (i.e. the index of the `m`-th column in the `n`-th batch
 /// is `m + Σ len(batch_k)`, for `k < n`).
+///
+/// # Errors
+///
+/// A sample point whose `y` is its own conjugate ([`complex_conjugate_line_coeffs`]).
 pub fn column_line_coeffs(
     sample_batches: &[ColumnSampleBatch],
-) -> Vec<Vec<(SecureField, SecureField, SecureField)>> {
+) -> Result<Vec<Vec<LineCoeffs>>, VerificationError> {
     sample_batches
         .iter()
         .map(|sample_batch| {
@@ -252,11 +259,21 @@ pub fn column_line_coeffs(
 
 /// For each sample point P, computes the equation of a line passing through P = (pₓ, pᵧ) ∈
 /// QM31 x QM31 and its conjugate P̄ = (p̄ₓ, p̄ᵧ), where the conjugate of an element of QM31 is with
-/// respect to CM31. Then evaluates the line equation at `domain_point`.
+/// respect to CM31. Then evaluates the line equation at `domain_point`, and inverts it.
+///
+/// # Errors
+///
+/// [`VerificationError::InvalidStructure`] when the line passes through `domain_point`: its
+/// value there is zero and has no inverse. For P on the circle with `Im(pᵧ) ≠ 0` this never
+/// happens at a point of the base field's circle. Write P = R + u·I, R and I in CM31²: the value
+/// vanishes at Q iff R − Q = s·I for some s in CM31, so |Q|² = |R|² + s²·|I|² (as R·I = 0 on the
+/// circle) = 1 + (s² − (2 + i))·|I|², and Q is on the circle only if |I|² = 0 (2 + i is not a
+/// square in CM31). An isotropic I ≠ 0 is (±i·a, a), and R·I = 0 then makes |R|² = 0, against
+/// |R|² + (2 + i)·|I|² = 1. Points off the circle can reach it.
 pub fn denominator_inverses(
     sample_points: &[CirclePoint<SecureField>],
     domain_point: CirclePoint<M31>,
-) -> Vec<CM31> {
+) -> Result<Vec<CM31>, VerificationError> {
     let mut denominators = Vec::new();
 
     // To find the equation of the line through P and P̄: a point Q = (qₓ, qᵧ) is on the line iff P -
@@ -274,14 +291,26 @@ pub fn denominator_inverses(
         let piy = sample_point.y.1;
         denominators.push((prx - domain_point.x) * piy - (pry - domain_point.y) * pix);
     }
+    if denominators.iter().any(CM31::is_zero) {
+        return Err(VerificationError::InvalidStructure(ToString::to_string(
+            "a sample point's conjugate line passes through a queried point",
+        )));
+    }
 
-    CM31::batch_inverse(&denominators)
+    Ok(CM31::batch_inverse(&denominators))
 }
 
-pub fn quotient_constants(sample_batches: &[ColumnSampleBatch]) -> QuotientConstants {
-    QuotientConstants {
-        line_coeffs: column_line_coeffs(sample_batches),
-    }
+/// The line coefficients of every sample batch ([`column_line_coeffs`]).
+///
+/// # Errors
+///
+/// A sample point whose `y` is its own conjugate ([`complex_conjugate_line_coeffs`]).
+pub fn quotient_constants(
+    sample_batches: &[ColumnSampleBatch],
+) -> Result<QuotientConstants, VerificationError> {
+    Ok(QuotientConstants {
+        line_coeffs: column_line_coeffs(sample_batches)?,
+    })
 }
 
 /// Holds the precomputed constant values used in each quotient evaluation.
@@ -430,5 +459,108 @@ impl DeepCoefficients {
 impl From<SecureField> for DeepCoefficients {
     fn from(alpha: SecureField) -> Self {
         Self::Powers(alpha)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use num_traits::{One, Zero};
+    use std_shims::{vec, Vec};
+
+    use super::{denominator_inverses, fri_answers, PointSample, TreeVec};
+    use crate::core::circle::{CirclePoint, M31_CIRCLE_GEN};
+    use crate::core::constraints::complex_conjugate_line_coeffs;
+    use crate::core::fields::cm31::CM31;
+    use crate::core::fields::m31::M31;
+    use crate::core::fields::qm31::{SecureField, QM31};
+    use crate::core::poly::circle::CanonicCoset;
+    use crate::core::utils::bit_reverse_index;
+    use crate::core::verifier::VerificationError;
+
+    const LOG_SIZE: u32 = 5;
+    const POSITION: usize = 3;
+
+    /// The lifting domain's point at `position`, as `fri_answers` reads it.
+    fn queried_point(position: usize) -> CirclePoint<M31> {
+        CanonicCoset::new(LOG_SIZE)
+            .circle_domain()
+            .at(bit_reverse_index(position, LOG_SIZE))
+    }
+
+    /// The point `real + u·imaginary`, coordinate by coordinate.
+    fn point(real: CirclePoint<M31>, imaginary: (CM31, CM31)) -> CirclePoint<SecureField> {
+        CirclePoint {
+            x: QM31(real.x.into(), imaginary.0),
+            y: QM31(real.y.into(), imaginary.1),
+        }
+    }
+
+    /// `fri_answers` over one column of log size [`LOG_SIZE`], sampled once at `sample`, and
+    /// queried at [`POSITION`].
+    fn answers(sample: CirclePoint<SecureField>) -> Result<Vec<SecureField>, VerificationError> {
+        fri_answers(
+            TreeVec(vec![vec![LOG_SIZE]]),
+            TreeVec(vec![vec![vec![PointSample {
+                point: sample,
+                value: SecureField::one(),
+            }]]]),
+            SecureField::one(),
+            &[POSITION],
+            TreeVec(vec![vec![vec![M31::from(5)]]]),
+            LOG_SIZE,
+        )
+    }
+
+    fn refused(result: Result<Vec<SecureField>, VerificationError>) -> bool {
+        matches!(result, Err(VerificationError::InvalidStructure(_)))
+    }
+
+    /// A sample point whose `y` is its own conjugate has no conjugate line: refused, where the
+    /// line's coefficients asserted.
+    #[test]
+    fn a_sample_point_with_y_in_cm31_is_refused() {
+        let in_cm31 = point(M31_CIRCLE_GEN, (CM31::from(M31::from(7)), CM31::zero()));
+        let sample = PointSample {
+            point: in_cm31,
+            value: SecureField::one(),
+        };
+        assert!(matches!(
+            complex_conjugate_line_coeffs(&sample, SecureField::one()),
+            Err(VerificationError::InvalidStructure(_))
+        ));
+        assert!(refused(answers(in_cm31)));
+        assert!(refused(answers(M31_CIRCLE_GEN.into_ef())));
+
+        let off_cm31 = point(M31_CIRCLE_GEN, (CM31::zero(), CM31::from(M31::from(7))));
+        assert!(complex_conjugate_line_coeffs(
+            &PointSample {
+                point: off_cm31,
+                value: SecureField::one(),
+            },
+            SecureField::one()
+        )
+        .is_ok());
+    }
+
+    /// A sample point `q + u·I`, `q` the queried point: its conjugate line passes through `q`,
+    /// so the DEEP quotient's denominator is zero there. Refused, where its inverse asserted; the
+    /// same point queried elsewhere is answered.
+    #[test]
+    fn a_conjugate_line_through_the_queried_point_is_refused() {
+        let queried = queried_point(POSITION);
+        let imaginary = (
+            CM31::from_u32_unchecked(3, 4),
+            CM31::from_u32_unchecked(5, 6),
+        );
+        let through = point(queried, imaginary);
+        assert!(matches!(
+            denominator_inverses(&[through], queried),
+            Err(VerificationError::InvalidStructure(_))
+        ));
+        assert!(refused(answers(through)));
+
+        let elsewhere = point(queried_point(POSITION + 1), imaginary);
+        assert!(denominator_inverses(&[elsewhere], queried).is_ok());
+        assert!(answers(elsewhere).is_ok());
     }
 }
