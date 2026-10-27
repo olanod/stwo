@@ -362,7 +362,10 @@ mod tests {
 
     use crate::core::fields::m31::{BaseField, M31};
     use crate::core::vcs::blake2_hash::{Blake2sHash, Blake2sHasher};
-    use crate::core::vcs_lifted::blake2_merkle::{Blake2sMerkleHasher, Blake2sMerkleHasherGeneric};
+    use crate::core::vcs_lifted::blake2_merkle::{
+        Blake2sM31MerkleHasher, Blake2sMerkleHasher, Blake2sMerkleHasherGeneric,
+    };
+    use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
     use crate::prover::backend::simd::column::BaseColumn;
     use crate::prover::backend::simd::SimdBackend;
     use crate::prover::backend::{Column, CpuBackend};
@@ -445,5 +448,81 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// A leaf of 4 M31s whose Blake2s digest's word 4 is `2^32 - 1`: a Blake2s-M31 leaf hash
+    /// reduces it to 1 on both backends.
+    const EDGE_LEAF: [u32; 4] = [0x52080a2a, 0x5368d2ec, 0x1b80dd5a, 0x2826d36f];
+
+    /// Two children whose Blake2s digest's word 0 is `2^32 - 2`, the node's word reduced to 0.
+    const EDGE_CHILDREN: [u32; 16] = [
+        0x33325aa3, 0x0, 0x3c6ef372, 0x5aa66d2c, 0x78dde6e4, 0x1715609d, 0x354cda57, 0x5384540f,
+        0x71bbcdc9, 0xff34782, 0x2e2ac13a, 0x4c623af4, 0x6a99b4ac, 0x8d12e65, 0x2708a81f,
+        0x454021d7,
+    ];
+
+    #[test]
+    fn test_m31_leaf_reduces_a_digest_word_at_the_top() {
+        const LOG_SIZE: u32 = 5;
+        const EDGE_ROW: usize = 19;
+        let cols = (0..EDGE_LEAF.len())
+            .map(|i| {
+                (0..1 << LOG_SIZE)
+                    .map(|row| match row {
+                        EDGE_ROW => M31::from_u32_unchecked(EDGE_LEAF[i]),
+                        row => M31::from(row * 4 + i),
+                    })
+                    .collect_vec()
+            })
+            .collect_vec();
+        let cols_simd = cols.iter().map(|c| BaseColumn::from_cpu(c)).collect_vec();
+
+        let cpu = <CpuBackend as MerkleOpsLifted<Blake2sM31MerkleHasher>>::build_leaves(
+            &cols.iter().collect_vec(),
+            LOG_SIZE,
+        );
+        let simd = <SimdBackend as MerkleOpsLifted<Blake2sM31MerkleHasher>>::build_leaves(
+            &cols_simd.iter().collect_vec(),
+            LOG_SIZE,
+        );
+
+        let mut raw = Blake2sMerkleHasher::default();
+        raw.update_leaf(&EDGE_LEAF.map(M31::from_u32_unchecked));
+        assert_eq!(raw.finalize().0[16..20], u32::MAX.to_le_bytes());
+        assert_eq!(cpu[EDGE_ROW].0[16..20], 1u32.to_le_bytes());
+        assert_eq!(cpu, simd);
+    }
+
+    #[test]
+    fn test_m31_node_reduces_a_digest_word_at_the_top() {
+        const LOG_SIZE: u32 = 5;
+        const EDGE_NODE: usize = 11;
+        let hash = |words: &[u32]| {
+            Blake2sHash(
+                words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect_vec()
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let layer: Vec<Blake2sHash> = (0u32..1 << (LOG_SIZE + 1))
+            .map(|i| match i as usize {
+                i if i == 2 * EDGE_NODE => hash(&EDGE_CHILDREN[..8]),
+                i if i == 2 * EDGE_NODE + 1 => hash(&EDGE_CHILDREN[8..]),
+                i => hash(&[i as u32; 8]),
+            })
+            .collect();
+
+        let cpu = <CpuBackend as MerkleOpsLifted<Blake2sM31MerkleHasher>>::build_next_layer(&layer);
+        let simd =
+            <SimdBackend as MerkleOpsLifted<Blake2sM31MerkleHasher>>::build_next_layer(&layer);
+
+        let raw =
+            Blake2sMerkleHasher::hash_children((layer[2 * EDGE_NODE], layer[2 * EDGE_NODE + 1]));
+        assert_eq!(raw.0[..4], (u32::MAX - 1).to_le_bytes());
+        assert_eq!(cpu[EDGE_NODE].0[..4], [0; 4]);
+        assert_eq!(cpu, simd);
     }
 }

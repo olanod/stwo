@@ -628,9 +628,15 @@ cfg_if::cfg_if! {
     }
 }
 
-/// Reduces 16 u32s modulo P. The implementation is the same as [`M31::reduce()`], adapted to SIMD.
+/// Reduces 16 u32s modulo P, each to its canonical value in `[0, P)`, as [`M31::reduce()`] does.
+///
+/// `val = hi * 2^31 + lo` with `hi <= 1` and `lo <= P` is congruent to `lo + hi <= P + 1`, which
+/// one conditional subtraction of `P` makes canonical. [`M31::reduce()`]'s formula is not used:
+/// its intermediate `val + (val >> 31) + 1` wraps in 32 bits for `val >= 2^32 - 2`, the two
+/// values it would map to `P - 1` and `P` instead of 0 and 1.
 pub fn reduce_to_m31_simd(val: u32x16) -> u32x16 {
-    ((((val >> MODULUS_BITS) + val + u32x16::splat(1)) >> MODULUS_BITS) + val) & u32x16::splat(P)
+    let folded = (val & MODULUS) + (val >> MODULUS_BITS);
+    min_u32x16(folded, folded - MODULUS)
 }
 
 #[cfg(test)]
@@ -643,7 +649,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::PackedM31;
-    use crate::core::fields::m31::{BaseField, M31};
+    use crate::core::fields::m31::{BaseField, M31, P};
     use crate::core::fields::FieldExpOps;
     use crate::prover::backend::simd::m31::reduce_to_m31_simd;
 
@@ -737,5 +743,37 @@ mod tests {
             reduce_to_m31_simd(simd_val),
             u32x16::from_array(std::array::from_fn(|i| M31::reduce(vals[i] as u64).0))
         );
+    }
+
+    /// The reduction is canonical over the whole `u32` range: at 0, around `P` and `2P`, and at
+    /// the top, where `2^32 - 2` and `2^32 - 1` reduce to 0 and 1.
+    #[test]
+    fn test_reduction_edges() {
+        let edges = [0, 1, P - 1, P, P + 1, 1 << 31, 2 * P - 1, 2 * P, u32::MAX];
+        let vals: [u32; 16] = std::array::from_fn(|i| edges.get(i).copied().unwrap_or(i as u32));
+        let reduced = reduce_to_m31_simd(u32x16::from_array(vals)).to_array();
+
+        for (val, reduced) in vals.into_iter().zip(reduced) {
+            assert_eq!(reduced, M31::reduce(val as u64).0, "{val:#x}");
+            assert!(reduced < P, "{val:#x}");
+        }
+        assert_eq!(reduced[7..9], [0, 1]);
+    }
+
+    /// The reduction is [`M31::reduce()`]'s on windows of 2^16 values at the bottom, around `P`,
+    /// and at the top of the `u32` range, `2P` among them.
+    #[test]
+    fn test_reduction_windows() {
+        const WINDOW: u32 = 1 << 16;
+        let starts = [0, P - WINDOW / 2, u32::MAX - (WINDOW - 1)];
+        for start in starts {
+            for chunk in (0..WINDOW).step_by(16) {
+                let vals: [u32; 16] = std::array::from_fn(|i| start + chunk + i as u32);
+                let reduced = reduce_to_m31_simd(u32x16::from_array(vals)).to_array();
+                for (val, reduced) in vals.into_iter().zip(reduced) {
+                    assert_eq!(reduced, M31::reduce(val as u64).0, "{val:#x}");
+                }
+            }
+        }
     }
 }
