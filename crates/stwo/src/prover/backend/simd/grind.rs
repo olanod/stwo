@@ -16,9 +16,22 @@ use crate::core::vcs::blake2b_hash::Blake2bHash;
 use crate::prover::backend::simd::blake2s::hash_16;
 use crate::prover::backend::simd::m31::{PackedM31, N_LANES};
 
-// Note: GRIND_LOW_BITS is a cap on how much extra time we need to wait for all threads to finish.
-// It must be <= 30 if we want to guarantee that the lowest 32 bits of the nonce are < 2^31 - 1.
+// The nonces are `(hi << 32) | lo` with `lo < 2^GRIND_LOW_BITS`, so the smallest valid nonce
+// depends on this constant alone. It must be <= 30 if we want to guarantee that the lowest 32 bits
+// of the nonce are < 2^31 - 1.
 const GRIND_LOW_BITS: u32 = 20;
+
+// The nonces a thread searches as one unit: `2^GRIND_CHUNK_BITS` consecutive ones, a part of one
+// `hi`'s range. A thread that finds a nonce waits for every lower chunk, so this caps the extra
+// time; it does not move the smallest nonce, the result whatever the threads.
+const GRIND_CHUNK_BITS: u32 = 14;
+const _: () = assert!(GRIND_CHUNK_BITS <= GRIND_LOW_BITS);
+
+/// The first nonce of chunk `chunk`: its `hi` above, its offset in `hi`'s range below.
+const fn chunk_start(chunk: u64) -> u64 {
+    let shift = GRIND_LOW_BITS - GRIND_CHUNK_BITS;
+    ((chunk >> shift) << 32) | ((chunk & ((1 << shift) - 1)) << GRIND_CHUNK_BITS)
+}
 
 impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> for SimdBackend {
     /// Outputs the smallest nonce of the form `(a << 32) | b`, where `0 <= a < 2^31 - 1` and
@@ -41,7 +54,7 @@ impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> f
 
         #[cfg(not(feature = "parallel"))]
         let res = (0..)
-            .find_map(|hi| grind_blake::<IS_M31_OUTPUT>(prefixed_digest, hi, pow_bits))
+            .find_map(|chunk| grind_blake::<IS_M31_OUTPUT>(prefixed_digest, chunk, pow_bits))
             .expect("Grind failed to find a solution.");
 
         #[cfg(feature = "parallel")]
@@ -59,18 +72,24 @@ impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> f
     }
 }
 
-fn grind_blake<const IS_M31_OUTPUT: bool>(digest: &[u32], hi: u32, pow_bits: u32) -> Option<u64> {
+fn grind_blake<const IS_M31_OUTPUT: bool>(
+    digest: &[u32],
+    chunk: u64,
+    pow_bits: u32,
+) -> Option<u64> {
     const DIGEST_SIZE: usize = std::mem::size_of::<[u32; 8]>();
     const NONCE_SIZE: usize = std::mem::size_of::<u64>();
     let zero: u32x16 = u32x16::splat(0);
-    let offsets_vec = u32x16::from(std::array::from_fn(|i| i as u32));
+    let start = chunk_start(chunk);
+    let (hi, first_low) = ((start >> 32) as u32, start as u32);
+    let offsets_vec = u32x16::from(std::array::from_fn(|i| first_low + i as u32));
     let pow_bits = u32x16::splat(pow_bits);
 
     let state: [_; 8] = std::array::from_fn(|i| u32x16::splat(digest[i]));
 
     let mut attempt_low = offsets_vec;
     let attempt_high = u32x16::splat(hi);
-    for low in (0..(1 << GRIND_LOW_BITS)).step_by(N_LANES) {
+    for low in (first_low..first_low + (1 << GRIND_CHUNK_BITS)).step_by(N_LANES) {
         let msgs = std::array::from_fn(|i| match i {
             0..=7 => state[i],
             8 => attempt_low,
@@ -94,37 +113,29 @@ fn grind_blake<const IS_M31_OUTPUT: bool>(digest: &[u32], hi: u32, pow_bits: u32
 }
 
 // Deterministically finds the smallest nonce that satisfies:
-// `hash(digest, nonce).trailing_zeros() >= pow_bits`.
+// `hash(digest, nonce).trailing_zeros() >= pow_bits`, `grind` searching one chunk of nonces in
+// increasing order, chunks in increasing order of their nonces.
 #[cfg(feature = "parallel")]
 fn parallel_grind<GRIND, DIGEST>(digest: DIGEST, pow_bits: u32, grind: GRIND) -> u64
 where
-    GRIND: Fn(DIGEST, u32, u32) -> Option<u64> + Send + Sync,
+    GRIND: Fn(DIGEST, u64, u32) -> Option<u64> + Send + Sync,
     DIGEST: Send + Sync + Copy,
 {
     use core::sync::atomic::Ordering;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::AtomicU64;
 
-    let n_workers = rayon::current_num_threads() as u32;
-    let next_chunk = AtomicU32::new(n_workers);
-    let smallest_good_chunk = AtomicU32::new(u32::MAX);
+    let n_workers = rayon::current_num_threads() as u64;
+    let next_chunk = AtomicU64::new(n_workers);
+    let smallest_good_chunk = AtomicU64::new(u64::MAX);
     let found = (0..n_workers)
         .into_par_iter()
         .filter_map(|thread_id| {
             let mut chunk_id = thread_id;
             loop {
                 if let Some(found) = grind(digest, chunk_id, pow_bits) {
-                    // Signal higher chunk handlers to stop.
-                    let current_smallest_chunk = smallest_good_chunk.load(Ordering::Relaxed);
-                    if chunk_id < current_smallest_chunk {
-                        // If fails, it means that another thread found a solution.
-                        // Every thread that found an answer returns it, the results are compared.
-                        let _ = smallest_good_chunk.compare_exchange(
-                            current_smallest_chunk,
-                            chunk_id,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
-                    }
+                    // Signal higher chunk handlers to stop. Every thread that found an answer
+                    // returns it, the results are compared.
+                    smallest_good_chunk.fetch_min(chunk_id, Ordering::Relaxed);
                     return Some(found);
                 }
                 // Assign the next chunk to this thread.
@@ -149,7 +160,7 @@ impl GrindOps<Blake2bChannel> for SimdBackend {
 
         #[cfg(not(feature = "parallel"))]
         let res = (0..)
-            .find_map(|hi| grind_blake2b(prefix, hi, pow_bits))
+            .find_map(|chunk| grind_blake2b(prefix, chunk, pow_bits))
             .expect("Grind failed to find a solution.");
 
         #[cfg(feature = "parallel")]
@@ -163,9 +174,9 @@ impl GrindOps<Blake2bChannel> for SimdBackend {
     }
 }
 
-fn grind_blake2b(prefix: Blake2bHash, hi: u32, pow_bits: u32) -> Option<u64> {
-    (0..1u64 << GRIND_LOW_BITS)
-        .map(|low| ((hi as u64) << 32) | low)
+fn grind_blake2b(prefix: Blake2bHash, chunk: u64, pow_bits: u32) -> Option<u64> {
+    let start = chunk_start(chunk);
+    (start..start + (1 << GRIND_CHUNK_BITS))
         .find(|&nonce| Blake2bChannel::pow_nonce_passes(&prefix, pow_bits, nonce))
 }
 
@@ -220,9 +231,9 @@ pub mod poseidon252 {
         }
     }
 
-    fn grind_poseidon(digest: FieldElement252, chunk_id: u32, pow_bits: u32) -> Option<u64> {
+    fn grind_poseidon(digest: FieldElement252, chunk_id: u64, pow_bits: u32) -> Option<u64> {
         for low in 0..(1 << GRIND_LOW_BITS) {
-            let nonce = low | ((chunk_id as u64) << 32);
+            let nonce = low | (chunk_id << 32);
             let hash = starknet_crypto::poseidon_hash(digest, nonce.into());
             let trailing_zeros =
                 u128::from_be_bytes(hash.to_bytes_be()[16..].try_into().unwrap()).trailing_zeros();
@@ -290,6 +301,72 @@ mod tests {
         let nonce = SimdBackend::grind(&channel, pow_bits);
         assert!(channel.verify_pow_nonce(pow_bits, nonce));
         test_grind_is_deterministic::<Blake2bChannel>();
+    }
+
+    /// The smallest nonce `(hi << 32) | lo`, `lo < 2^GRIND_LOW_BITS`, that `channel` accepts.
+    fn smallest_nonce<C: Channel>(channel: &C, pow_bits: u32) -> u64 {
+        (0..)
+            .flat_map(|hi: u64| (0..1 << GRIND_LOW_BITS).map(move |lo| (hi << 32) | lo))
+            .find(|&nonce| channel.verify_pow_nonce(pow_bits, nonce))
+            .unwrap()
+    }
+
+    /// The grind's nonce is the smallest, past the first chunk too, for any number of threads.
+    fn test_grind_is_the_smallest_nonce<C: Channel + Sync>()
+    where
+        SimdBackend: GrindOps<C>,
+    {
+        let pow_bits = 16;
+        let mut past_first_chunk = 0;
+        for seed in 0..8 {
+            let mut channel = C::default();
+            channel.mix_u64(seed);
+            let smallest = smallest_nonce(&channel, pow_bits);
+            past_first_chunk += usize::from(smallest >= 1 << GRIND_CHUNK_BITS);
+            #[cfg(feature = "parallel")]
+            for threads in [1, 3, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    pool.install(|| SimdBackend::grind(&channel, pow_bits)),
+                    smallest,
+                    "seed {seed}, {threads} threads"
+                );
+            }
+            #[cfg(not(feature = "parallel"))]
+            assert_eq!(
+                SimdBackend::grind(&channel, pow_bits),
+                smallest,
+                "seed {seed}"
+            );
+        }
+        assert!(past_first_chunk > 0, "every nonce in the first chunk");
+    }
+
+    #[test]
+    fn test_grind_blake_is_the_smallest_nonce() {
+        test_grind_is_the_smallest_nonce::<Blake2sChannel>();
+        test_grind_is_the_smallest_nonce::<crate::core::channel::Blake2sM31Channel>();
+    }
+
+    #[test]
+    fn test_grind_blake2b_is_the_smallest_nonce() {
+        test_grind_is_the_smallest_nonce::<Blake2bChannel>();
+    }
+
+    #[test]
+    fn chunks_cover_the_nonces_in_order() {
+        let per_hi = 1 << (GRIND_LOW_BITS - GRIND_CHUNK_BITS);
+        assert_eq!(chunk_start(0), 0);
+        assert_eq!(chunk_start(1), 1 << GRIND_CHUNK_BITS);
+        assert_eq!(
+            chunk_start(per_hi - 1) + (1 << GRIND_CHUNK_BITS),
+            1 << GRIND_LOW_BITS
+        );
+        assert_eq!(chunk_start(per_hi), 1 << 32);
+        assert_eq!(chunk_start(per_hi + 1), (1 << 32) | (1 << GRIND_CHUNK_BITS));
     }
 
     #[test]
