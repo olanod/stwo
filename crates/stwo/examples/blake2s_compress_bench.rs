@@ -26,16 +26,16 @@ use stwo::prover::vcs::ops::MerkleOps;
 
 type Compress = fn([u32x16; 8], [u32x16; 16], u32x16, u32x16, u32x16, u32x16) -> [u32x16; 8];
 
-/// Hashes the rows of `cols` (each a column of `u32x16` packs of 16 rows) the way the SIMD
-/// Merkle leaf layer does: 16 columns per compression, the last one finalized.
-fn hash_leaves(cols: &[Vec<u32x16>], compress: Compress) -> Vec<[u32x16; 8]> {
-    let n_packs = cols[0].len();
+/// Hashes the rows of the columns in `chunks` (each column a `Vec` of `u32x16` packs of 16 rows,
+/// grouped 16 columns per chunk) the way the SIMD Merkle leaf layer does: one compression per
+/// chunk, the last one finalized.
+fn hash_leaves(chunks: &[&[Vec<u32x16>]], compress: Compress) -> Vec<[u32x16; 8]> {
+    let n_packs = chunks[0][0].len();
     let zero = u32x16::splat(0);
     (0..n_packs)
         .map(|i| {
             let mut state = INITIAL_STATE;
             let mut t = 0u32;
-            let chunks: Vec<_> = cols.chunks(16).collect();
             for (k, chunk) in chunks.iter().enumerate() {
                 t += 4 * chunk.len() as u32;
                 let msgs: [u32x16; 16] = array::from_fn(|j| chunk.get(j).map_or(zero, |c| c[i]));
@@ -97,9 +97,10 @@ fn main() {
             secs * 1e9 / n_compressions as f64
         );
     };
+    let chunks: Vec<&[Vec<u32x16>]> = cols.chunks(16).collect();
     let time = |compress: Compress| {
         let start = Instant::now();
-        let res = black_box(hash_leaves(black_box(&cols), compress));
+        let res = black_box(hash_leaves(black_box(&chunks), compress));
         (start.elapsed().as_secs_f64(), digest(&res))
     };
 

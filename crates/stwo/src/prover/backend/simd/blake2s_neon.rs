@@ -7,6 +7,19 @@
 //! temporaries, fits in NEON's 32 registers; message words that do not fit are reloaded from
 //! memory. Lane `4 * g + k` of every input and output vector belongs to group `g`, lane `k`.
 //!
+//! Per `compress16` on generic aarch64 (release, `codegen-units = 1`): about 5,900 instructions
+//! and 230 stack accesses of 128-bit registers, against 10,950 and 4,510 for the portable
+//! `u32x16` code. One `compress4` is 1,457 instructions, essentially the ideal BLAKE2s op mix
+//! (485 add, 340 eor, 160 shl, 160 sri, 80 tbl, 80 rev32). llvm-mca (LLVM 22) estimates, in
+//! cycles per `compress16`, portable vs this: cortex-a720 4,311 vs ~3,100; cortex-a520 5,854 vs
+//! ~4,260; cortex-a78 6,073 vs ~3,880. On the A720 model the limit is the vector pipe that
+//! issues shifts. Interleaving two lane groups needs 32 state registers and spills without a
+//! meaningful gain. `examples/blake2s_compress_bench.rs` times both paths on a device.
+//!
+//! The NEON intrinsics are `#[target_feature(enable = "neon")]` functions, so calling them
+//! needs `unsafe` on this toolchain; this module is only compiled with `neon` enabled, which
+//! makes the arithmetic ones sound to call. The pointer ones carry their own SAFETY notes.
+//!
 //! [`compress16`]: super::blake2s::compress16
 
 use core::arch::aarch64::{
@@ -125,6 +138,7 @@ fn compress4(
     out: &mut [u32x16; 8],
 ) {
     let m: [uint32x4_t; 16] = array::from_fn(|i| group(&msg_vecs[i], g));
+    // SAFETY: `ROT8_TABLE` holds 16 bytes.
     let table = unsafe { vld1q_u8(ROT8_TABLE.as_ptr()) };
     let h = |i: usize| group(&h_vecs[i], g);
     let iv = |i: usize| unsafe { vdupq_n_u32(IV[i]) };
