@@ -157,3 +157,7 @@ required-features = ["prover"]
 harness = false
 name = "fri_quotients"
 required-features = ["prover"]
+
+[[example]]
+name = "blake2s_compress_bench"
+required-features = ["prover"]
