@@ -366,7 +366,29 @@ pub fn untranspose_states(mut states: [u32x16; 8]) -> [u32x16; 8] {
 }
 
 /// Compresses 16 blake2s instances.
+///
+/// On aarch64 this runs the NEON implementation, which compresses the 16 instances as four
+/// groups of four lanes so the state fits in registers; elsewhere it is
+/// [`compress16_portable`]. Both compute the same function.
 pub fn compress16(
+    h_vecs: [u32x16; 8],
+    msg_vecs: [u32x16; 16],
+    count_low: u32x16,
+    count_high: u32x16,
+    lastblock: u32x16,
+    lastnode: u32x16,
+) -> [u32x16; 8] {
+    #[cfg(target_arch = "aarch64")]
+    return super::blake2s_neon::compress16(
+        h_vecs, msg_vecs, count_low, count_high, lastblock, lastnode,
+    );
+    #[cfg(not(target_arch = "aarch64"))]
+    compress16_portable(h_vecs, msg_vecs, count_low, count_high, lastblock, lastnode)
+}
+
+/// Compresses 16 blake2s instances with portable `u32x16` arithmetic.
+#[inline(always)]
+pub fn compress16_portable(
     h_vecs: [u32x16; 8],
     msg_vecs: [u32x16; 16],
     count_low: u32x16,

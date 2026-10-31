@@ -12,6 +12,8 @@ pub mod bit_reverse;
 pub mod blake2b;
 pub mod blake2s;
 pub mod blake2s_lifted;
+#[cfg(target_arch = "aarch64")]
+mod blake2s_neon;
 #[cfg(test)]
 pub mod blake2s_ref;
 pub mod circle;
